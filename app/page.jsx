@@ -1,3 +1,4 @@
+import LivePricePanel from './components/LivePricePanel';
 const API_BASE = 'https://api.polygon.io';
 
 export const dynamic = 'force-dynamic';
@@ -641,7 +642,7 @@ export default async function HomePage({ searchParams }) {
           <div style={{ fontSize: 24, fontWeight: 700 }}>{stock.companyName}</div>
         </div>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
-          <div style={{ color: '#6b7280', marginBottom: 8 }}>Current Price</div>
+          <div style={{ color: '#6b7280', marginBottom: 8 }}>Starting Snapshot Price</div>
           <div style={{ fontSize: 24, fontWeight: 700 }}>{formatCurrency(stock.price ?? analysis.price)}</div>
         </div>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
@@ -653,6 +654,8 @@ export default async function HomePage({ searchParams }) {
           <div style={{ fontSize: 24, fontWeight: 700 }}>{formatCompactNumber(stock.marketCap)}</div>
         </div>
       </section>
+
+      <LivePricePanel ticker={ticker} initialPrice={stock.price ?? analysis.price} initialDailyChangePercent={stock.dailyChangePercent} />
 
       <ChartSummaryPanel stock={stock} analysis={analysis} barsCount={bars.length} />
 
