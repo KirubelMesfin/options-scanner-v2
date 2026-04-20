@@ -143,6 +143,22 @@ function probabilityBand(score) {
   return 'Below 50%';
 }
 
+function toSetupProbabilityScore(analysis) {
+  const chartScore = scoreChartQuality(analysis);
+  const setupLabel = analysis?.intradaySignals?.setupLabel ?? analysis?.setup ?? 'weak trend';
+  const momentumLabel = analysis?.intradaySignals?.momentumLabel ?? 'weak';
+
+  let adjusted = chartScore;
+  if (setupLabel === 'breakout') adjusted += 4;
+  else if (setupLabel === 'pullback') adjusted += 2;
+  else if (setupLabel === 'weak trend') adjusted -= 8;
+
+  if (momentumLabel === 'strong') adjusted += 3;
+  else if (momentumLabel === 'weak') adjusted -= 2;
+
+  return clamp(adjusted, 5, 95);
+}
+
 function scoreChartQuality(analysis) {
   const { trend, setup, price, ma20, ma50, rsi, atr } = analysis;
   if ([price, ma20, ma50, rsi, atr].some((v) => v == null)) return 35;
@@ -214,11 +230,21 @@ function scoreContractQuality(contract, stockPrice, targetDte) {
     ivScore = Math.max(0, 1 - distanceFromIdeal / 0.45) * 8;
   }
 
+  let qualityPenalty = 0;
+  const strikeVsSpotPct = stockPrice != null && contract.strike != null && stockPrice !== 0 ? ((contract.strike - stockPrice) / stockPrice) * 100 : null;
+  if (strikeVsSpotPct != null && strikeVsSpotPct < -10) qualityPenalty += Math.min(18, Math.abs(strikeVsSpotPct + 10) * 1.2);
+  if (deltaAbs != null && deltaAbs > 0.85) qualityPenalty += Math.min(20, (deltaAbs - 0.85) * 120);
+  if (deltaAbs != null && deltaAbs < 0.2) qualityPenalty += 8;
+  if (spreadPct == null) qualityPenalty += 10;
+  if (contract.bid == null || contract.ask == null) qualityPenalty += 10;
+  if (volume < 25) qualityPenalty += 8;
+  if (openInterest < 100) qualityPenalty += 8;
+
   return {
-    score: strikeScore + dteScore + deltaScore + volumeScore + oiScore + spreadScore + ivScore,
+    score: Math.max(1, strikeScore + dteScore + deltaScore + volumeScore + oiScore + spreadScore + ivScore - qualityPenalty),
     details: {
       strikeDistancePct,
-      strikeVsSpotPct: stockPrice != null && contract.strike != null && stockPrice !== 0 ? ((contract.strike - stockPrice) / stockPrice) * 100 : null,
+      strikeVsSpotPct,
       dte,
       spreadPct,
       volume,
@@ -227,16 +253,17 @@ function scoreContractQuality(contract, stockPrice, targetDte) {
   };
 }
 
-function confidenceFromSignals(setupLabel, momentumLabel, shortMovePercent) {
-  if (setupLabel === 'breakout' && momentumLabel === 'strong') return 'High';
-  if (setupLabel === 'breakout' && momentumLabel === 'moderate') return 'Moderate-High';
-  if (setupLabel === 'pullback' && (shortMovePercent ?? 0) >= -2) return 'Moderate';
+function confidenceFromScores({ setupProbabilityScore, contractScore, setupLabel, momentumLabel, shortMovePercent }) {
+  if (setupProbabilityScore < 50 || contractScore < 45) return 'Low';
   if (setupLabel === 'weak trend') return 'Low';
+  if (setupProbabilityScore >= 80 && contractScore >= 75 && setupLabel === 'breakout' && momentumLabel === 'strong') return 'High';
+  if (setupProbabilityScore >= 65 && contractScore >= 60) return 'Moderate-High';
+  if (setupLabel === 'pullback' && (shortMovePercent ?? 0) >= -2 && contractScore >= 50) return 'Moderate';
   return 'Moderate';
 }
 
 function buildContractExplanation(contract, analysis, scorePack) {
-  const { finalScore, band, confidenceLabel, strikeVsSpotPct, dte, spreadPct, liquidityLabel } = scorePack;
+  const { strikeVsSpotPct, dte, spreadPct, liquidityLabel } = scorePack;
   const signals = analysis?.intradaySignals ?? {};
   const setupLabel = signals.setupLabel ?? analysis.setup ?? 'weak trend';
   const momentumLabel = signals.momentumLabel ?? 'weak';
@@ -250,7 +277,13 @@ function buildContractExplanation(contract, analysis, scorePack) {
   const spreadText = spreadPct == null ? 'spread not available' : `spread is ${(spreadPct * 100).toFixed(1)}% of mid`;
   const dteText = dte == null ? 'expiration not available' : `${dte} DTE fits the target window`;
 
-  return `Confidence ${confidenceLabel} (${band}, score ${finalScore.toFixed(1)}/100): setup ${setupLabel} with ${momentumLabel} momentum, ${strikeDistanceText}, ${dteText}, liquidity is ${liquidityLabel}, and ${spreadText}.`;
+  return {
+    setup: `${setupLabel} with ${momentumLabel} momentum`,
+    momentum: `${momentumLabel} momentum, ${(signals.shortMovePercent ?? 0).toFixed(1)}% move over last 5 bars`,
+    strikeFit: strikeDistanceText,
+    expirationFit: dteText,
+    liquidity: `${liquidityLabel} liquidity, ${spreadText}`
+  };
 }
 
 function scoreWithSetupSignals(contract, stockPrice, targetDte, analysis) {
@@ -297,7 +330,13 @@ function scoreWithSetupSignals(contract, stockPrice, targetDte, analysis) {
 
   const liquidityComposite = (base.details.volume ?? 0) + (base.details.openInterest ?? 0) * 0.2;
   const liquidityLabel = liquidityComposite >= 1200 ? 'strong' : liquidityComposite >= 450 ? 'solid' : 'light';
-  const confidenceLabel = confidenceFromSignals(setupLabel, momentumLabel, shortMovePercent);
+  const confidenceLabel = confidenceFromScores({
+    setupProbabilityScore: 0,
+    contractScore: clamp(base.score + setupAdjustment, 1, 100),
+    setupLabel,
+    momentumLabel,
+    shortMovePercent
+  });
 
   return {
     baseScore: base.score,
@@ -305,6 +344,32 @@ function scoreWithSetupSignals(contract, stockPrice, targetDte, analysis) {
     contractScore: clamp(base.score + setupAdjustment, 1, 100),
     details: { ...base.details, setupLabel, momentumLabel, liquidityLabel, confidenceLabel }
   };
+}
+
+function isValidContractCore(contract, stockPrice) {
+  if (!contract?.expiration || contract?.strike == null || stockPrice == null || stockPrice <= 0) return false;
+  if (contract.strike <= 0) return false;
+  if (contract.impliedVolatility != null && contract.impliedVolatility <= 0) return false;
+  if (contract.delta != null && (contract.delta < 0 || contract.delta > 1)) return false;
+  return true;
+}
+
+function applyWindowCandidateFilters(contracts, stockPrice, window, strictMode) {
+  const inWindow = contracts.filter((c) => {
+    const dte = getDaysToExpiration(c.expiration);
+    return dte != null && dte >= window.minDte && dte <= window.maxDte;
+  });
+  const coreValid = inWindow.filter((c) => isValidContractCore(c, stockPrice));
+  if (!strictMode) return coreValid;
+
+  const moneynessValid = coreValid.filter((c) => {
+    const strikeVsSpotPct = ((c.strike - stockPrice) / stockPrice) * 100;
+    return strikeVsSpotPct >= -15 && strikeVsSpotPct <= 15;
+  });
+  if (!moneynessValid.length) return [];
+
+  const preferredDelta = moneynessValid.filter((c) => c.delta == null || (c.delta >= 0.25 && c.delta <= 0.85));
+  return preferredDelta.length ? preferredDelta : moneynessValid;
 }
 
 async function fetchPolygonJson(url) {
@@ -548,6 +613,9 @@ function analyzeChart(bars) {
   analysis.invalidation = plan.invalidation;
   analysis.target = plan.target;
   analysis.intradaySignals = buildIntradaySignals({ bars, trend: analysis.trend, ma20: analysis.ma20 });
+  if (analysis.intradaySignals?.setupLabel) {
+    analysis.setup = analysis.intradaySignals.setupLabel;
+  }
 
   return analysis;
 }
@@ -592,26 +660,30 @@ async function getOptionsData(ticker, apiKey) {
 
 function buildRecommendations(contracts, stockPrice, analysis) {
   const windows = [
-    { key: 'best1MonthCall', label: 'Best 1-Month Call', minDte: 20, maxDte: 45, targetDte: 32 },
-    { key: 'best2MonthCall', label: 'Best 2-Month Call', minDte: 46, maxDte: 80, targetDte: 62 }
+    { key: 'best1MonthCall', label: 'Best 1-Month Call', minDte: 20, maxDte: 45, targetDte: 32, strict: false },
+    { key: 'best2MonthCall', label: 'Best 2-Month Call', minDte: 46, maxDte: 80, targetDte: 62, strict: true }
   ];
 
-  const chartScore = scoreChartQuality(analysis);
+  const setupProbabilityScore = toSetupProbabilityScore(analysis);
+  const setupBand = probabilityBand(setupProbabilityScore);
 
   const picked = {};
 
   for (const window of windows) {
-    const ranked = contracts
+    const filteredContracts = applyWindowCandidateFilters(contracts, stockPrice, window, window.strict);
+    const ranked = filteredContracts
       .map((contract) => {
         const setupAwareScore = scoreWithSetupSignals(contract, stockPrice, window.targetDte, analysis);
-        const finalScore = chartScore * 0.52 + setupAwareScore.contractScore * 0.48;
-        const band = probabilityBand(finalScore);
         const contractScore = setupAwareScore.contractScore;
-        const confidenceLabel = setupAwareScore.details.confidenceLabel;
+        const signals = analysis?.intradaySignals ?? {};
+        const confidenceLabel = confidenceFromScores({
+          setupProbabilityScore,
+          contractScore,
+          setupLabel: signals.setupLabel ?? analysis.setup ?? 'weak trend',
+          momentumLabel: signals.momentumLabel ?? 'weak',
+          shortMovePercent: signals.shortMovePercent
+        });
         const contractReasoning = buildContractExplanation(contract, analysis, {
-          finalScore,
-          band,
-          confidenceLabel,
           strikeVsSpotPct: setupAwareScore.details.strikeVsSpotPct,
           dte: setupAwareScore.details.dte,
           spreadPct: setupAwareScore.details.spreadPct,
@@ -619,18 +691,18 @@ function buildRecommendations(contracts, stockPrice, analysis) {
         });
         return {
           ...contract,
-          score: finalScore,
-          finalCompositeScore: Number(finalScore.toFixed(1)),
+          score: contractScore,
+          finalCompositeScore: Number(contractScore.toFixed(1)),
           contractScore: Number(contractScore.toFixed(1)),
-          chartQualityScore: chartScore,
+          chartQualityScore: setupProbabilityScore,
           confidenceLabel,
-          chartSetupType: analysis.setup,
+          chartSetupType: analysis?.intradaySignals?.setupLabel ?? analysis.setup,
           trend: analysis.trend,
           buyZone: analysis.buyZone,
           invalidation: analysis.invalidation,
           target: analysis.target,
           entryQuality: analysis.entryQuality,
-          estimatedSetupProbability: band,
+          estimatedSetupProbability: setupBand,
           contractReasoning,
           strikeDistancePct: setupAwareScore.details.strikeDistancePct,
           strikeVsSpotPct: setupAwareScore.details.strikeVsSpotPct,
@@ -638,7 +710,6 @@ function buildRecommendations(contracts, stockPrice, analysis) {
           spreadPct: setupAwareScore.details.spreadPct
         };
       })
-      .filter((c) => c.dte != null && c.dte >= window.minDte && c.dte <= window.maxDte)
       .sort((a, b) => b.score - a.score);
 
     picked[window.key] = ranked[0] ?? null;
@@ -656,26 +727,28 @@ function RecommendationCard({ title, contract }) {
       {contract ? (
         <>
           <p style={{ margin: '0 0 8px 0', fontWeight: 700 }}>{contract.ticker}</p>
-          <p style={{ margin: '0 0 8px 0', color: '#374151' }}>
-            Strike {formatCurrency(contract.strike)} · Exp {contract.expiration} · Delta {contract.delta != null ? contract.delta.toFixed(2) : 'N/A'}
-          </p>
-          <p style={{ margin: '0 0 8px 0', color: '#374151' }}>
-            Bid/Ask {formatCurrency(contract.bid)} / {formatCurrency(contract.ask)} · IV {contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(2) : 'N/A'}
-          </p>
-          <p style={{ margin: '0 0 8px 0', color: '#111827', fontWeight: 600 }}>Estimated setup probability: {contract.estimatedSetupProbability}</p>
-          <p style={{ margin: '0 0 8px 0', color: '#111827', fontWeight: 600 }}>
-            Contract Score {contract.contractScore ?? 'N/A'} · Confidence {contract.confidenceLabel ?? 'N/A'}
-          </p>
-          <p style={{ margin: '0 0 6px 0', color: '#374151' }}>
-            Setup {contract.chartSetupType} · Buy Zone {contract.buyZone}
-          </p>
-          <p style={{ margin: '0 0 6px 0', color: '#374151' }}>
-            Invalidation {contract.invalidation} · Target {contract.target}
-          </p>
-          <p style={{ margin: 0, color: '#4b5563', lineHeight: 1.45 }}>{contract.contractReasoning}</p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8, marginBottom: 10 }}>
+            <Stat label="Setup Probability" value={contract.estimatedSetupProbability} />
+            <Stat label="Contract Score" value={contract.contractScore ?? 'N/A'} />
+            <Stat label="Confidence" value={contract.confidenceLabel ?? 'N/A'} />
+          </div>
+          <div style={{ border: '1px solid #f3f4f6', borderRadius: 10, padding: 10, marginBottom: 10, color: '#374151' }}>
+            <div style={{ marginBottom: 4 }}>Strike: {formatCurrency(contract.strike)}</div>
+            <div style={{ marginBottom: 4 }}>Expiration: {contract.expiration ?? 'N/A'}</div>
+            <div style={{ marginBottom: 4 }}>Delta: {contract.delta != null ? contract.delta.toFixed(2) : 'N/A'}</div>
+            <div style={{ marginBottom: 4 }}>IV: {contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(2) : 'N/A'}</div>
+            <div>Bid/Ask: {formatCurrency(contract.bid)} / {formatCurrency(contract.ask)}</div>
+          </div>
+          <ul style={{ margin: 0, paddingLeft: 18, color: '#4b5563', lineHeight: 1.4 }}>
+            <li><strong>Setup:</strong> {contract.contractReasoning.setup}</li>
+            <li><strong>Momentum:</strong> {contract.contractReasoning.momentum}</li>
+            <li><strong>Strike Fit:</strong> {contract.contractReasoning.strikeFit}</li>
+            <li><strong>Expiration Fit:</strong> {contract.contractReasoning.expirationFit}</li>
+            <li><strong>Liquidity:</strong> {contract.contractReasoning.liquidity}</li>
+          </ul>
         </>
       ) : (
-        <p style={{ margin: 0, color: '#6b7280' }}>No contract met this expiration window with current filters/liquidity.</p>
+        <p style={{ margin: 0, color: '#6b7280' }}>No suitable contract found for this window under current quality filters.</p>
       )}
     </div>
   );
