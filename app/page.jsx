@@ -1,6 +1,5 @@
 import LivePricePanel from './components/LivePricePanel';
 const API_BASE = 'https://api.polygon.io';
-const YAHOO_QUOTE_URL = 'https://query1.finance.yahoo.com/v7/finance/quote';
 const YAHOO_CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart';
 
 export const dynamic = 'force-dynamic';
@@ -23,10 +22,6 @@ function formatCurrency(value) {
   return value == null ? 'N/A' : `$${value.toFixed(2)}`;
 }
 
-function formatCompactNumber(value) {
-  if (value == null) return 'N/A';
-  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 2 }).format(value);
-}
 
 function formatPercent(value) {
   return value == null ? 'N/A' : `${value.toFixed(2)}%`;
@@ -236,7 +231,7 @@ function buildContractExplanation(contract, analysis, finalScore, band) {
   return `Estimated setup probability: ${band} (score ${finalScore.toFixed(1)}/100). ${pieces.slice(0, 4).join(', ')}.`;
 }
 
-async function fetchJson(url) {
+async function fetchPolygonJson(url) {
   const response = await fetch(url, {
     cache: 'no-store',
     headers: {
@@ -251,32 +246,29 @@ async function fetchJson(url) {
   return response.json();
 }
 
-async function getStockContext(ticker) {
-  const quoteUrl = `${YAHOO_QUOTE_URL}?symbols=${encodeURIComponent(ticker)}`;
-  const quoteResult = await fetchJson(quoteUrl);
-  const quote = quoteResult?.quoteResponse?.result?.[0];
+async function fetchChartJson(url) {
+  const response = await fetch(url, {
+    cache: 'no-store',
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'Mozilla/5.0 (compatible; options-scanner-v2/1.0)'
+    }
+  });
 
-  if (!quote) {
-    throw new Error(`No Yahoo Finance quote found for ticker ${ticker}.`);
+  if (!response.ok) {
+    const details = await response.text().catch(() => '');
+    const error = new Error(`Daily chart request failed (${response.status})`);
+    error.status = response.status;
+    error.details = details;
+    throw error;
   }
 
-  return {
-    price:
-      toNumber(quote?.regularMarketPrice) ??
-      toNumber(quote?.postMarketPrice) ??
-      toNumber(quote?.preMarketPrice),
-    dailyChangePercent:
-      toNumber(quote?.regularMarketChangePercent) ??
-      toNumber(quote?.postMarketChangePercent) ??
-      toNumber(quote?.preMarketChangePercent),
-    marketCap: toNumber(quote?.marketCap),
-    companyName: quote?.longName ?? quote?.shortName ?? quote?.displayName ?? ticker
-  };
+  return response.json();
 }
 
 async function getDailyBars(ticker) {
   const url = `${YAHOO_CHART_URL}/${encodeURIComponent(ticker)}?interval=1d&range=6mo&includePrePost=false&events=div,splits`;
-  const data = await fetchJson(url);
+  const data = await fetchChartJson(url);
   const result = data?.chart?.result?.[0];
 
   if (!result) return [];
@@ -299,6 +291,21 @@ async function getDailyBars(ticker) {
       v: toNumber(volumes[idx])
     }))
     .filter((bar) => bar.t != null && [bar.o, bar.h, bar.l, bar.c].every((value) => value != null));
+}
+
+
+function buildStockSnapshotFromBars(ticker, bars) {
+  const closes = bars.map((bar) => bar.c).filter((value) => value != null);
+  const latest = closes.at(-1) ?? null;
+  const previous = closes.at(-2) ?? null;
+
+  return {
+    price: latest,
+    dailyChangePercent: previous ? ((latest - previous) / previous) * 100 : null,
+    companyName: ticker,
+    stockSourceLabel: 'Delayed daily stock data',
+    stockFreshnessLabel: 'Delayed / last close'
+  };
 }
 
 function calculateRsi(closes, period = 14) {
@@ -416,7 +423,7 @@ async function getOptionsChain(ticker, apiKey) {
   let safetyCounter = 0;
 
   while (nextUrl && safetyCounter < 4) {
-    const data = await fetchJson(nextUrl);
+    const data = await fetchPolygonJson(nextUrl);
     if (Array.isArray(data?.results)) results.push(...data.results);
     nextUrl = data?.next_url ? `${data.next_url}&apiKey=${apiKey}` : null;
     safetyCounter += 1;
@@ -425,53 +432,7 @@ async function getOptionsChain(ticker, apiKey) {
   return results.map(normalizeContract);
 }
 
-function formatFutureDate(daysAhead) {
-  const target = new Date(Date.now() + daysAhead * 24 * 60 * 60 * 1000);
-  return target.toISOString().slice(0, 10);
-}
-
-function createMockContract({ ticker, expiration, strike, stockPrice, priceFactor }) {
-  const intrinsic = Math.max(stockPrice - strike, 0);
-  const timeValue = Math.max(stockPrice * priceFactor, 0.15);
-  const midpoint = Number((intrinsic * 0.18 + timeValue).toFixed(2));
-  const bid = Number(Math.max(midpoint - 0.08, 0.01).toFixed(2));
-  const ask = Number((midpoint + 0.08).toFixed(2));
-  const iv = Number((0.22 + Math.abs(strike - stockPrice) / stockPrice).toFixed(3));
-
-  return {
-    ticker: `MOCK-${ticker}-${expiration.replaceAll('-', '')}-C${Math.round(strike)}`,
-    contractType: 'call',
-    strike: Number(strike.toFixed(2)),
-    expiration,
-    bid,
-    ask,
-    lastPrice: midpoint,
-    volume: Math.round(80 + (stockPrice / strike) * 120),
-    openInterest: Math.round(180 + (stockPrice / strike) * 260),
-    impliedVolatility: iv,
-    delta: Number((0.35 + (stockPrice - strike) / stockPrice).toFixed(3)),
-    midpoint,
-    dataSource: 'mock'
-  };
-}
-
-function buildMockContracts(ticker, stockPrice) {
-  const basePrice = stockPrice && stockPrice > 0 ? stockPrice : 100;
-  const expirations = [formatFutureDate(30), formatFutureDate(60)];
-  const strikeSteps = [0.9, 0.95, 1, 1.05, 1.1];
-  const contracts = [];
-
-  for (const expiration of expirations) {
-    for (const step of strikeSteps) {
-      const strike = basePrice * step;
-      contracts.push(createMockContract({ ticker, expiration, strike, stockPrice: basePrice, priceFactor: 0.012 }));
-    }
-  }
-
-  return contracts;
-}
-
-async function getOptionsData(ticker, apiKey, stockPrice) {
+async function getOptionsData(ticker, apiKey) {
   try {
     const contracts = await getOptionsChain(ticker, apiKey);
     return {
@@ -479,11 +440,14 @@ async function getOptionsData(ticker, apiKey, stockPrice) {
       restrictionMessage: ''
     };
   } catch (error) {
-    if (error instanceof PolygonAccessError && error.status === 403) {
+    if (error instanceof PolygonAccessError && (error.status === 401 || error.status === 403)) {
+      const code = error.status;
       return {
-        contracts: buildMockContracts(ticker, stockPrice),
+        contracts: [],
         restrictionMessage:
-          'Live options chain data is restricted on your Polygon plan (HTTP 403). Showing chart analysis + fallback simulated call contracts.'
+          code === 401
+            ? 'Polygon options request failed with HTTP 401. Verify POLYGON_API_KEY in Vercel Project Settings and redeploy. Chart analysis remains available with delayed daily stock data.'
+            : 'Live options chain data is restricted on your Polygon plan (HTTP 403). Chart analysis remains available with delayed daily stock data.'
       };
     }
 
@@ -595,7 +559,7 @@ function Stat({ label, value }) {
 }
 
 export default async function HomePage({ searchParams }) {
-  const apiKey = process.env.POLYGON_API_KEY;
+  const apiKey = process.env.POLYGON_API_KEY?.trim();
   const ticker = (searchParams?.ticker || 'AAPL').trim().toUpperCase();
 
   if (!apiKey) {
@@ -607,20 +571,31 @@ export default async function HomePage({ searchParams }) {
     );
   }
 
-  let stock = { price: null, dailyChangePercent: null, marketCap: null, companyName: ticker };
+  let stock = {
+    price: null,
+    dailyChangePercent: null,
+    companyName: ticker,
+    stockSourceLabel: 'Delayed daily stock data',
+    stockFreshnessLabel: 'Delayed / last close'
+  };
   let bars = [];
   let contracts = [];
   let restrictionMessage = '';
-  let errorMessage = '';
+  const notices = [];
 
   try {
-    stock = await getStockContext(ticker);
     bars = await getDailyBars(ticker);
-    const optionsData = await getOptionsData(ticker, apiKey, stock.price);
+    stock = buildStockSnapshotFromBars(ticker, bars);
+  } catch (error) {
+    notices.push(`Stock chart data unavailable: ${error.message || 'unknown error'}.`);
+  }
+
+  try {
+    const optionsData = await getOptionsData(ticker, apiKey);
     contracts = optionsData.contracts;
     restrictionMessage = optionsData.restrictionMessage;
   } catch (error) {
-    errorMessage = error.message || 'Failed to load recommendation engine data.';
+    notices.push(`Options chain unavailable: ${error.message || 'unknown error'}.`);
   }
 
   const analysis = analyzeChart(bars);
@@ -630,7 +605,7 @@ export default async function HomePage({ searchParams }) {
     <main style={{ maxWidth: 1200, margin: '0 auto', padding: 24 }}>
       <h1 style={{ marginBottom: 6 }}>Chart-Aware Options Recommendation Engine</h1>
       <p style={{ marginTop: 0, color: '#4b5563' }}>
-        Uses Yahoo Finance stock/chart data and Polygon options chain data to estimate setup quality for call contracts. “Estimated setup probability” is a scoring band, not a calibrated statistical probability.
+        Uses Polygon options chain data and delayed daily stock/chart data to estimate setup quality for call contracts. “Estimated setup probability” is a scoring band, not a calibrated statistical probability.
       </p>
 
       <form method="GET" style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 16 }}>
@@ -646,8 +621,14 @@ export default async function HomePage({ searchParams }) {
         </button>
       </form>
 
-      {errorMessage ? (
-        <div style={{ background: '#fef2f2', color: '#991b1b', border: '1px solid #fecaca', borderRadius: 10, padding: 12, marginBottom: 16 }}>{errorMessage}</div>
+      {notices.length ? (
+        <div style={{ background: '#f9fafb', color: '#374151', border: '1px solid #e5e7eb', borderRadius: 10, padding: 12, marginBottom: 16 }}>
+          {notices.map((notice) => (
+            <p key={notice} style={{ margin: '0 0 6px 0' }}>
+              {notice}
+            </p>
+          ))}
+        </div>
       ) : null}
       {restrictionMessage ? (
         <div style={{ background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: 10, padding: 12, marginBottom: 16 }}>{restrictionMessage}</div>
@@ -667,8 +648,13 @@ export default async function HomePage({ searchParams }) {
           <div style={{ fontSize: 24, fontWeight: 700, color: (stock.dailyChangePercent ?? 0) >= 0 ? '#047857' : '#b91c1c' }}>{formatPercent(stock.dailyChangePercent)}</div>
         </div>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
-          <div style={{ color: '#6b7280', marginBottom: 8 }}>Market Cap</div>
-          <div style={{ fontSize: 24, fontWeight: 700 }}>{formatCompactNumber(stock.marketCap)}</div>
+          <div style={{ color: '#6b7280', marginBottom: 8 }}>Stock Source</div>
+          <div style={{ fontSize: 20, fontWeight: 700 }}>{stock.stockSourceLabel}</div>
+          <div style={{ color: '#6b7280', marginTop: 6 }}>{stock.stockFreshnessLabel}</div>
+        </div>
+        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
+          <div style={{ color: '#6b7280', marginBottom: 8 }}>Options Source</div>
+          <div style={{ fontSize: 20, fontWeight: 700 }}>Polygon options</div>
         </div>
       </section>
 
