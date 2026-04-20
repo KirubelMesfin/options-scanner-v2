@@ -1,5 +1,7 @@
 import LivePricePanel from './components/LivePricePanel';
 const API_BASE = 'https://api.polygon.io';
+const YAHOO_QUOTE_URL = 'https://query1.finance.yahoo.com/v7/finance/quote';
+const YAHOO_CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart';
 
 export const dynamic = 'force-dynamic';
 
@@ -235,7 +237,13 @@ function buildContractExplanation(contract, analysis, finalScore, band) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
+  const response = await fetch(url, {
+    cache: 'no-store',
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'Mozilla/5.0 (compatible; options-scanner-v2/1.0)'
+    }
+  });
   if (!response.ok) {
     const details = await response.text().catch(() => '');
     throw new PolygonAccessError(`Polygon request failed (${response.status})`, response.status, details);
@@ -243,45 +251,54 @@ async function fetchJson(url) {
   return response.json();
 }
 
-async function getStockContext(ticker, apiKey) {
-  const snapshotUrl = `${API_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}?apiKey=${apiKey}`;
-  const detailsUrl = `${API_BASE}/v3/reference/tickers/${ticker}?apiKey=${apiKey}`;
+async function getStockContext(ticker) {
+  const quoteUrl = `${YAHOO_QUOTE_URL}?symbols=${encodeURIComponent(ticker)}`;
+  const quoteResult = await fetchJson(quoteUrl);
+  const quote = quoteResult?.quoteResponse?.result?.[0];
 
-  const [snapshotResult, detailsResult] = await Promise.allSettled([fetchJson(snapshotUrl), fetchJson(detailsUrl)]);
-
-  const snapshot = snapshotResult.status === 'fulfilled' ? snapshotResult.value?.ticker : null;
-  const details = detailsResult.status === 'fulfilled' ? detailsResult.value?.results : null;
-
-  const price =
-    toNumber(snapshot?.lastTrade?.p) ??
-    toNumber(snapshot?.lastQuote?.P) ??
-    toNumber(snapshot?.day?.c) ??
-    toNumber(snapshot?.prevDay?.c);
+  if (!quote) {
+    throw new Error(`No Yahoo Finance quote found for ticker ${ticker}.`);
+  }
 
   return {
-    price,
-    dailyChangePercent: toNumber(snapshot?.todaysChangePerc),
-    marketCap: toNumber(details?.market_cap),
-    companyName: details?.name ?? ticker
+    price:
+      toNumber(quote?.regularMarketPrice) ??
+      toNumber(quote?.postMarketPrice) ??
+      toNumber(quote?.preMarketPrice),
+    dailyChangePercent:
+      toNumber(quote?.regularMarketChangePercent) ??
+      toNumber(quote?.postMarketChangePercent) ??
+      toNumber(quote?.preMarketChangePercent),
+    marketCap: toNumber(quote?.marketCap),
+    companyName: quote?.longName ?? quote?.shortName ?? quote?.displayName ?? ticker
   };
 }
 
-async function getDailyBars(ticker, apiKey) {
-  const now = new Date();
-  const from = new Date(now.getTime() - 180 * 24 * 60 * 60 * 1000);
-  const fromDate = from.toISOString().slice(0, 10);
-  const toDate = now.toISOString().slice(0, 10);
-  const url = `${API_BASE}/v2/aggs/ticker/${ticker}/range/1/day/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=500&apiKey=${apiKey}`;
+async function getDailyBars(ticker) {
+  const url = `${YAHOO_CHART_URL}/${encodeURIComponent(ticker)}?interval=1d&range=6mo&includePrePost=false&events=div,splits`;
   const data = await fetchJson(url);
+  const result = data?.chart?.result?.[0];
 
-  return (data?.results ?? []).map((bar) => ({
-    t: bar.t,
-    o: toNumber(bar.o),
-    h: toNumber(bar.h),
-    l: toNumber(bar.l),
-    c: toNumber(bar.c),
-    v: toNumber(bar.v)
-  }));
+  if (!result) return [];
+
+  const timestamps = Array.isArray(result?.timestamp) ? result.timestamp : [];
+  const quote = result?.indicators?.quote?.[0] ?? {};
+  const opens = Array.isArray(quote?.open) ? quote.open : [];
+  const highs = Array.isArray(quote?.high) ? quote.high : [];
+  const lows = Array.isArray(quote?.low) ? quote.low : [];
+  const closes = Array.isArray(quote?.close) ? quote.close : [];
+  const volumes = Array.isArray(quote?.volume) ? quote.volume : [];
+
+  return timestamps
+    .map((ts, idx) => ({
+      t: toNumber(ts) != null ? Number(ts) * 1000 : null,
+      o: toNumber(opens[idx]),
+      h: toNumber(highs[idx]),
+      l: toNumber(lows[idx]),
+      c: toNumber(closes[idx]),
+      v: toNumber(volumes[idx])
+    }))
+    .filter((bar) => bar.t != null && [bar.o, bar.h, bar.l, bar.c].every((value) => value != null));
 }
 
 function calculateRsi(closes, period = 14) {
@@ -597,8 +614,8 @@ export default async function HomePage({ searchParams }) {
   let errorMessage = '';
 
   try {
-    stock = await getStockContext(ticker, apiKey);
-    bars = await getDailyBars(ticker, apiKey);
+    stock = await getStockContext(ticker);
+    bars = await getDailyBars(ticker);
     const optionsData = await getOptionsData(ticker, apiKey, stock.price);
     contracts = optionsData.contracts;
     restrictionMessage = optionsData.restrictionMessage;
@@ -613,7 +630,7 @@ export default async function HomePage({ searchParams }) {
     <main style={{ maxWidth: 1200, margin: '0 auto', padding: 24 }}>
       <h1 style={{ marginBottom: 6 }}>Chart-Aware Options Recommendation Engine</h1>
       <p style={{ marginTop: 0, color: '#4b5563' }}>
-        Uses Polygon daily chart + options chain data to estimate setup quality for call contracts. “Estimated setup probability” is a scoring band, not a calibrated statistical probability.
+        Uses Yahoo Finance stock/chart data and Polygon options chain data to estimate setup quality for call contracts. “Estimated setup probability” is a scoring band, not a calibrated statistical probability.
       </p>
 
       <form method="GET" style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 16 }}>
