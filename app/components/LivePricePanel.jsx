@@ -28,7 +28,7 @@ export default function LivePricePanel({ ticker, initialPrice, initialDailyChang
   const [live, setLive] = useState({
     price: initialPrice ?? null,
     dailyChangePercent: initialDailyChangePercent ?? null,
-    source: 'snapshot',
+    source: 'yahoo-finance',
     updatedAt: null,
     intraday: {
       barsCount: 0,
@@ -88,7 +88,7 @@ export default function LivePricePanel({ ticker, initialPrice, initialDailyChang
         <Stat label="Intraday Range (1m)" value={`${formatCurrency(live?.intraday?.intradayLow)} - ${formatCurrency(live?.intraday?.intradayHigh)}`} />
         <Stat label="1m Bars Fetched" value={live?.intraday?.barsCount ?? 0} />
         <Stat label="Last 1m Close" value={formatCurrency(live?.intraday?.lastMinuteClose)} />
-        <Stat label="Feed Source" value={live.source === 'last-trade' ? 'Last Trade' : 'Snapshot'} />
+        <Stat label="Feed Source" value={live.source === 'yahoo-finance' ? 'Yahoo Finance' : live.source ?? 'N/A'} />
         <Stat label="Last Updated" value={formatTime(live.updatedAt)} />
       </div>
       {live.error ? <p style={{ color: '#b91c1c', marginBottom: 0 }}>Live updates temporarily unavailable: {live.error}</p> : null}

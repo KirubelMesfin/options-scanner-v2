@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
 
-const API_BASE = 'https://api.polygon.io';
+const YAHOO_QUOTE_URL = 'https://query1.finance.yahoo.com/v7/finance/quote';
+const YAHOO_CHART_URL = 'https://query1.finance.yahoo.com/v8/finance/chart';
 const DEFAULT_INTRADAY = {
+  interval: '1m',
   barsCount: 0,
   moveFromOpenPercent: null,
   intradayHigh: null,
@@ -17,26 +19,21 @@ function toNumber(value) {
 async function fetchJson(url) {
   const response = await fetch(url, {
     cache: 'no-store',
-    headers: { Accept: 'application/json' }
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'Mozilla/5.0 (compatible; options-scanner-v2/1.0)'
+    }
   });
 
   if (!response.ok) {
     const details = await response.text().catch(() => '');
-    const error = new Error(`Polygon request failed (${response.status})`);
+    const error = new Error(`Yahoo Finance request failed (${response.status})`);
     error.status = response.status;
     error.details = details;
     throw error;
   }
 
   return response.json();
-}
-
-function isoDate(date) {
-  return date.toISOString().slice(0, 10);
-}
-
-function hasValue(value) {
-  return value !== null && value !== undefined;
 }
 
 function firstNumber(candidates, debugKey, debugBucket) {
@@ -62,39 +59,23 @@ function firstText(candidates, debugKey, debugBucket) {
   return null;
 }
 
-async function getIntradayContext(ticker, apiKey, debug) {
-  const now = new Date();
-  const from = new Date(now.getTime() - 8 * 60 * 60 * 1000);
-  const url = `${API_BASE}/v2/aggs/ticker/${ticker}/range/1/minute/${isoDate(from)}/${isoDate(now)}?adjusted=true&sort=asc&limit=50000&apiKey=${apiKey}`;
-  const data = await fetchJson(url);
-  const bars = Array.isArray(data?.results)
-    ? data.results
-    : Array.isArray(data?.results?.results)
-      ? data.results.results
-      : [];
+function extractIntradayFromChart(data, interval) {
+  const result = data?.chart?.result?.[0];
+  const quote = result?.indicators?.quote?.[0] ?? {};
 
-  debug.intraday = {
-    endpoint: `/v2/aggs/ticker/${ticker}/range/1/minute/...`,
-    barsPath: Array.isArray(data?.results)
-      ? 'results'
-      : Array.isArray(data?.results?.results)
-        ? 'results.results'
-        : 'none',
-    barsCount: bars.length,
-    raw: data
-  };
+  const opens = Array.isArray(quote.open) ? quote.open.map(toNumber).filter((v) => v != null) : [];
+  const closes = Array.isArray(quote.close) ? quote.close.map(toNumber).filter((v) => v != null) : [];
+  const highs = Array.isArray(quote.high) ? quote.high.map(toNumber).filter((v) => v != null) : [];
+  const lows = Array.isArray(quote.low) ? quote.low.map(toNumber).filter((v) => v != null) : [];
 
-  if (!bars.length) {
-    return DEFAULT_INTRADAY;
-  }
+  if (!closes.length) return DEFAULT_INTRADAY;
 
-  const open = toNumber(bars[0]?.o);
-  const lastClose = toNumber(bars[bars.length - 1]?.c);
-  const highs = bars.map((bar) => toNumber(bar.h)).filter((v) => v != null);
-  const lows = bars.map((bar) => toNumber(bar.l)).filter((v) => v != null);
+  const open = opens[0] ?? closes[0] ?? null;
+  const lastClose = closes.at(-1) ?? null;
 
   return {
-    barsCount: bars.length,
+    interval,
+    barsCount: closes.length,
     moveFromOpenPercent: open && lastClose ? ((lastClose - open) / open) * 100 : null,
     intradayHigh: highs.length ? Math.max(...highs) : null,
     intradayLow: lows.length ? Math.min(...lows) : null,
@@ -102,90 +83,65 @@ async function getIntradayContext(ticker, apiKey, debug) {
   };
 }
 
+async function getIntradayContext(ticker, debug) {
+  const intervals = ['1m', '5m'];
+
+  for (const interval of intervals) {
+    const url = `${YAHOO_CHART_URL}/${encodeURIComponent(ticker)}?interval=${interval}&range=1d&includePrePost=true&events=div,splits`;
+
+    try {
+      const data = await fetchJson(url);
+      const errorDescription = data?.chart?.error?.description;
+      if (errorDescription) {
+        debug.intradayAttempts.push({ interval, endpoint: '/v8/finance/chart/:ticker', error: errorDescription });
+        continue;
+      }
+
+      const intraday = extractIntradayFromChart(data, interval);
+      debug.intradayAttempts.push({ interval, endpoint: '/v8/finance/chart/:ticker', barsCount: intraday.barsCount });
+      if (intraday.barsCount > 0) return intraday;
+    } catch (error) {
+      debug.intradayAttempts.push({ interval, endpoint: '/v8/finance/chart/:ticker', error: error.message });
+    }
+  }
+
+  return DEFAULT_INTRADAY;
+}
+
 export async function GET(request) {
-  const apiKey = process.env.POLYGON_API_KEY;
   const { searchParams } = new URL(request.url);
   const ticker = (searchParams.get('ticker') || 'AAPL').trim().toUpperCase();
   const includeDebug = searchParams.get('debug') !== '0';
-
-  if (!apiKey) {
-    return NextResponse.json({ error: 'POLYGON_API_KEY is not set.' }, { status: 500 });
-  }
 
   try {
     const debug = {
       requestedTicker: ticker,
       endpoints: {},
       selectedSources: {},
-      fieldsFound: {}
-    };
-    const snapshotUrl = `${API_BASE}/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}?apiKey=${apiKey}`;
-    const lastTradeUrl = `${API_BASE}/v2/last/trade/${ticker}?apiKey=${apiKey}`;
-
-    const [snapshotResult, lastTradeResult, intradayResult] = await Promise.allSettled([
-      fetchJson(snapshotUrl),
-      fetchJson(lastTradeUrl),
-      getIntradayContext(ticker, apiKey, debug.endpoints)
-    ]);
-
-    const snapshotPayload = snapshotResult.status === 'fulfilled' ? snapshotResult.value : null;
-    const snapshot =
-      snapshotPayload?.ticker ??
-      snapshotPayload?.results?.ticker ??
-      snapshotPayload?.results ??
-      snapshotPayload?.data?.ticker ??
-      null;
-
-    const lastTradePayload = lastTradeResult.status === 'fulfilled' ? lastTradeResult.value : null;
-    const lastTrade =
-      lastTradePayload?.results ??
-      lastTradePayload?.lastTrade ??
-      lastTradePayload?.trade ??
-      lastTradePayload?.data?.results ??
-      null;
-
-    debug.endpoints.lastTrade = {
-      endpoint: `/v2/last/trade/${ticker}`,
-      status: lastTradeResult.status,
-      raw: lastTradePayload,
-      extractedPath:
-        hasValue(lastTradePayload?.results)
-          ? 'results'
-          : hasValue(lastTradePayload?.lastTrade)
-            ? 'lastTrade'
-            : hasValue(lastTradePayload?.trade)
-              ? 'trade'
-              : hasValue(lastTradePayload?.data?.results)
-                ? 'data.results'
-                : null
+      fieldsFound: {},
+      intradayAttempts: []
     };
 
-    debug.endpoints.snapshot = {
-      endpoint: `/v2/snapshot/locale/us/markets/stocks/tickers/${ticker}`,
-      status: snapshotResult.status,
-      raw: snapshotPayload,
-      extractedPath:
-        hasValue(snapshotPayload?.ticker)
-          ? 'ticker'
-          : hasValue(snapshotPayload?.results?.ticker)
-            ? 'results.ticker'
-            : hasValue(snapshotPayload?.results)
-              ? 'results'
-              : hasValue(snapshotPayload?.data?.ticker)
-                ? 'data.ticker'
-                : null
+    const quoteUrl = `${YAHOO_QUOTE_URL}?symbols=${encodeURIComponent(ticker)}`;
+    const [quoteResult, intraday] = await Promise.all([fetchJson(quoteUrl), getIntradayContext(ticker, debug)]);
+    const quote = quoteResult?.quoteResponse?.result?.[0] ?? null;
+
+    debug.endpoints.quote = {
+      endpoint: '/v7/finance/quote',
+      foundQuote: Boolean(quote),
+      raw: quoteResult
     };
+
+    if (!quote) {
+      return NextResponse.json({ error: `No Yahoo Finance quote found for ticker ${ticker}.` }, { status: 404 });
+    }
 
     const price = firstNumber(
       [
-        { label: 'lastTrade.p', value: lastTrade?.p },
-        { label: 'lastTrade.price', value: lastTrade?.price },
-        { label: 'snapshot.lastTrade.p', value: snapshot?.lastTrade?.p },
-        { label: 'snapshot.lastTrade.price', value: snapshot?.lastTrade?.price },
-        { label: 'snapshot.min.c', value: snapshot?.min?.c },
-        { label: 'snapshot.day.c', value: snapshot?.day?.c },
-        { label: 'snapshot.prevDay.c', value: snapshot?.prevDay?.c },
-        { label: 'snapshot.lastQuote.P', value: snapshot?.lastQuote?.P }
+        { label: 'quote.regularMarketPrice', value: quote?.regularMarketPrice },
+        { label: 'quote.postMarketPrice', value: quote?.postMarketPrice },
+        { label: 'quote.preMarketPrice', value: quote?.preMarketPrice },
+        { label: 'quote.bid', value: quote?.bid }
       ],
       'price',
       debug.fieldsFound
@@ -193,11 +149,9 @@ export async function GET(request) {
 
     const dailyChangePercent = firstNumber(
       [
-        { label: 'snapshot.todaysChangePerc', value: snapshot?.todaysChangePerc },
-        { label: 'snapshot.day.change_percent', value: snapshot?.day?.change_percent },
-        { label: 'snapshot.day.percent_change', value: snapshot?.day?.percent_change },
-        { label: 'snapshot.day.pctChange', value: snapshot?.day?.pctChange },
-        { label: 'snapshot.session.change_percent', value: snapshot?.session?.change_percent }
+        { label: 'quote.regularMarketChangePercent', value: quote?.regularMarketChangePercent },
+        { label: 'quote.postMarketChangePercent', value: quote?.postMarketChangePercent },
+        { label: 'quote.preMarketChangePercent', value: quote?.preMarketChangePercent }
       ],
       'dailyChangePercent',
       debug.fieldsFound
@@ -205,55 +159,37 @@ export async function GET(request) {
 
     const marketStatus = firstText(
       [
-        { label: 'snapshot.market_status', value: snapshot?.market_status },
-        { label: 'snapshot.marketStatus', value: snapshot?.marketStatus },
-        { label: 'snapshot.session.market_status', value: snapshot?.session?.market_status }
+        { label: 'quote.marketState', value: quote?.marketState },
+        { label: 'quote.exchange', value: quote?.exchange }
       ],
       'marketStatus',
       debug.fieldsFound
     );
 
-    const tradeTimestamp = firstNumber(
+    const updatedAtSeconds = firstNumber(
       [
-        { label: 'lastTrade.t', value: lastTrade?.t },
-        { label: 'lastTrade.timestamp', value: lastTrade?.timestamp },
-        { label: 'snapshot.lastTrade.t', value: snapshot?.lastTrade?.t },
-        { label: 'snapshot.lastTrade.timestamp', value: snapshot?.lastTrade?.timestamp },
-        { label: 'snapshot.min.t', value: snapshot?.min?.t }
+        { label: 'quote.regularMarketTime', value: quote?.regularMarketTime },
+        { label: 'quote.postMarketTime', value: quote?.postMarketTime },
+        { label: 'quote.preMarketTime', value: quote?.preMarketTime }
       ],
       'updatedAt',
       debug.fieldsFound
     );
 
-    const intraday = intradayResult.status === 'fulfilled' ? intradayResult.value : DEFAULT_INTRADAY;
-
     debug.selectedSources = {
-      price:
-        debug.fieldsFound.price && debug.fieldsFound.price.startsWith('lastTrade')
-          ? 'last-trade'
-          : debug.fieldsFound.price
-            ? 'snapshot'
-            : null,
-      dailyChangePercent: debug.fieldsFound.dailyChangePercent ? 'snapshot' : null,
-      marketStatus: debug.fieldsFound.marketStatus ? 'snapshot' : null,
-      intraday: intradayResult.status === 'fulfilled' ? 'aggregates' : null
+      price: debug.fieldsFound.price ? 'yahoo-quote' : null,
+      dailyChangePercent: debug.fieldsFound.dailyChangePercent ? 'yahoo-quote' : null,
+      marketStatus: debug.fieldsFound.marketStatus ? 'yahoo-quote' : null,
+      intraday: intraday.barsCount ? `yahoo-chart-${intraday.interval}` : null
     };
-
-    if (intradayResult.status !== 'fulfilled') {
-      debug.endpoints.intraday = {
-        endpoint: `/v2/aggs/ticker/${ticker}/range/1/minute/...`,
-        status: intradayResult.status,
-        error: intradayResult.reason?.message || 'Failed to load aggregates.'
-      };
-    }
 
     return NextResponse.json({
       ticker,
       price,
       dailyChangePercent,
       marketStatus,
-      source: debug.selectedSources.price ?? (lastTradeResult.status === 'fulfilled' ? 'last-trade' : 'snapshot'),
-      updatedAt: tradeTimestamp ? new Date(tradeTimestamp).toISOString() : new Date().toISOString(),
+      source: 'yahoo-finance',
+      updatedAt: updatedAtSeconds ? new Date(updatedAtSeconds * 1000).toISOString() : new Date().toISOString(),
       intraday,
       debug: includeDebug ? debug : undefined
     });
