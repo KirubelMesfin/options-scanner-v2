@@ -218,22 +218,93 @@ function scoreContractQuality(contract, stockPrice, targetDte) {
     score: strikeScore + dteScore + deltaScore + volumeScore + oiScore + spreadScore + ivScore,
     details: {
       strikeDistancePct,
+      strikeVsSpotPct: stockPrice != null && contract.strike != null && stockPrice !== 0 ? ((contract.strike - stockPrice) / stockPrice) * 100 : null,
       dte,
-      spreadPct
+      spreadPct,
+      volume,
+      openInterest
     }
   };
 }
 
-function buildContractExplanation(contract, analysis, finalScore, band) {
-  const pieces = [];
-  if (analysis.trend === 'bullish') pieces.push('price trend is bullish above key moving averages');
-  if (analysis.setup === 'breakout') pieces.push('chart is pressing recent highs in a breakout structure');
-  if (analysis.setup === 'pullback') pieces.push('chart is pulling back into support within an uptrend');
-  if ((contract.volume ?? 0) >= 200) pieces.push('contract has usable volume');
-  if ((contract.openInterest ?? 0) >= 500) pieces.push('open interest is supportive');
-  if (contract.delta != null) pieces.push(`delta is ${contract.delta.toFixed(2)} for directional exposure`);
+function confidenceFromSignals(setupLabel, momentumLabel, shortMovePercent) {
+  if (setupLabel === 'breakout' && momentumLabel === 'strong') return 'High';
+  if (setupLabel === 'breakout' && momentumLabel === 'moderate') return 'Moderate-High';
+  if (setupLabel === 'pullback' && (shortMovePercent ?? 0) >= -2) return 'Moderate';
+  if (setupLabel === 'weak trend') return 'Low';
+  return 'Moderate';
+}
 
-  return `Estimated setup probability: ${band} (score ${finalScore.toFixed(1)}/100). ${pieces.slice(0, 4).join(', ')}.`;
+function buildContractExplanation(contract, analysis, scorePack) {
+  const { finalScore, band, confidenceLabel, strikeVsSpotPct, dte, spreadPct, liquidityLabel } = scorePack;
+  const signals = analysis?.intradaySignals ?? {};
+  const setupLabel = signals.setupLabel ?? analysis.setup ?? 'weak trend';
+  const momentumLabel = signals.momentumLabel ?? 'weak';
+  const strikeDistanceText =
+    strikeVsSpotPct == null
+      ? 'strike distance is unavailable'
+      : strikeVsSpotPct >= 0
+        ? `strike is ${strikeVsSpotPct.toFixed(1)}% OTM`
+        : `strike is ${Math.abs(strikeVsSpotPct).toFixed(1)}% ITM`;
+
+  const spreadText = spreadPct == null ? 'spread not available' : `spread is ${(spreadPct * 100).toFixed(1)}% of mid`;
+  const dteText = dte == null ? 'expiration not available' : `${dte} DTE fits the target window`;
+
+  return `Confidence ${confidenceLabel} (${band}, score ${finalScore.toFixed(1)}/100): setup ${setupLabel} with ${momentumLabel} momentum, ${strikeDistanceText}, ${dteText}, liquidity is ${liquidityLabel}, and ${spreadText}.`;
+}
+
+function scoreWithSetupSignals(contract, stockPrice, targetDte, analysis) {
+  const base = scoreContractQuality(contract, stockPrice, targetDte);
+  const signals = analysis?.intradaySignals ?? {};
+  const setupLabel = signals.setupLabel ?? analysis.setup ?? 'weak trend';
+  const momentumLabel = signals.momentumLabel ?? 'weak';
+  const shortMovePercent = signals.shortMovePercent;
+  const recentHigh = signals.recentHigh;
+  const recentLow = signals.recentLow;
+  const supportReference = signals.supportReference;
+
+  let setupAdjustment = 0;
+  const strikeVsSpotPct = base.details.strikeVsSpotPct;
+
+  if (setupLabel === 'breakout' && momentumLabel === 'strong') {
+    if (strikeVsSpotPct != null) {
+      const distanceFromPreferred = Math.abs(strikeVsSpotPct - 3);
+      setupAdjustment += Math.max(0, 1 - distanceFromPreferred / 8) * 12;
+      if (strikeVsSpotPct < -3) setupAdjustment -= 6;
+      if (strikeVsSpotPct > 10) setupAdjustment -= 5;
+    }
+    if (base.details.dte != null) setupAdjustment += Math.max(0, 1 - Math.abs(base.details.dte - targetDte) / 26) * 6;
+  } else if (setupLabel === 'pullback') {
+    if (strikeVsSpotPct != null) {
+      const distanceFromPreferred = Math.abs(strikeVsSpotPct + 1);
+      setupAdjustment += Math.max(0, 1 - distanceFromPreferred / 7) * 11;
+      if (strikeVsSpotPct > 7) setupAdjustment -= 8;
+    }
+    if (base.details.dte != null) setupAdjustment += Math.max(0, 1 - Math.abs(base.details.dte - (targetDte + 5)) / 28) * 6;
+  } else if (setupLabel === 'weak trend') {
+    setupAdjustment -= 8;
+    if (strikeVsSpotPct != null && strikeVsSpotPct > 5) setupAdjustment -= 10;
+  }
+
+  if (recentHigh != null && stockPrice != null && contract.strike != null && setupLabel === 'breakout' && contract.strike > recentHigh * 1.08) {
+    setupAdjustment -= 4;
+  }
+  if (recentLow != null && supportReference != null && shortMovePercent != null && setupLabel === 'pullback') {
+    if (stockPrice != null && stockPrice < supportReference) setupAdjustment -= 5;
+    if (shortMovePercent < -3) setupAdjustment -= 3;
+    if (recentLow > 0 && supportReference / recentLow > 1.05) setupAdjustment -= 2;
+  }
+
+  const liquidityComposite = (base.details.volume ?? 0) + (base.details.openInterest ?? 0) * 0.2;
+  const liquidityLabel = liquidityComposite >= 1200 ? 'strong' : liquidityComposite >= 450 ? 'solid' : 'light';
+  const confidenceLabel = confidenceFromSignals(setupLabel, momentumLabel, shortMovePercent);
+
+  return {
+    baseScore: base.score,
+    setupAdjustment,
+    contractScore: clamp(base.score + setupAdjustment, 1, 100),
+    details: { ...base.details, setupLabel, momentumLabel, liquidityLabel, confidenceLabel }
+  };
 }
 
 async function fetchPolygonJson(url) {
@@ -521,8 +592,8 @@ async function getOptionsData(ticker, apiKey) {
 
 function buildRecommendations(contracts, stockPrice, analysis) {
   const windows = [
-    { key: 'bestOneMonth', label: 'Best 1-Month Call', minDte: 20, maxDte: 45, targetDte: 32 },
-    { key: 'bestTwoMonth', label: 'Best 2-Month Call', minDte: 46, maxDte: 80, targetDte: 62 }
+    { key: 'best1MonthCall', label: 'Best 1-Month Call', minDte: 20, maxDte: 45, targetDte: 32 },
+    { key: 'best2MonthCall', label: 'Best 2-Month Call', minDte: 46, maxDte: 80, targetDte: 62 }
   ];
 
   const chartScore = scoreChartQuality(analysis);
@@ -532,33 +603,49 @@ function buildRecommendations(contracts, stockPrice, analysis) {
   for (const window of windows) {
     const ranked = contracts
       .map((contract) => {
-        const { score: contractScore, details } = scoreContractQuality(contract, stockPrice, window.targetDte);
-        const finalScore = chartScore * 0.58 + contractScore * 0.42;
+        const setupAwareScore = scoreWithSetupSignals(contract, stockPrice, window.targetDte, analysis);
+        const finalScore = chartScore * 0.52 + setupAwareScore.contractScore * 0.48;
         const band = probabilityBand(finalScore);
+        const contractScore = setupAwareScore.contractScore;
+        const confidenceLabel = setupAwareScore.details.confidenceLabel;
+        const contractReasoning = buildContractExplanation(contract, analysis, {
+          finalScore,
+          band,
+          confidenceLabel,
+          strikeVsSpotPct: setupAwareScore.details.strikeVsSpotPct,
+          dte: setupAwareScore.details.dte,
+          spreadPct: setupAwareScore.details.spreadPct,
+          liquidityLabel: setupAwareScore.details.liquidityLabel
+        });
         return {
           ...contract,
           score: finalScore,
-          contractQualityScore: contractScore,
+          finalCompositeScore: Number(finalScore.toFixed(1)),
+          contractScore: Number(contractScore.toFixed(1)),
           chartQualityScore: chartScore,
-          estimatedSetupProbability: band,
+          confidenceLabel,
           chartSetupType: analysis.setup,
           trend: analysis.trend,
           buyZone: analysis.buyZone,
           invalidation: analysis.invalidation,
           target: analysis.target,
           entryQuality: analysis.entryQuality,
-          reasoning: buildContractExplanation(contract, analysis, finalScore, band),
-          strikeDistancePct: details.strikeDistancePct,
-          dte: details.dte,
-          spreadPct: details.spreadPct
+          estimatedSetupProbability: band,
+          contractReasoning,
+          strikeDistancePct: setupAwareScore.details.strikeDistancePct,
+          strikeVsSpotPct: setupAwareScore.details.strikeVsSpotPct,
+          dte: setupAwareScore.details.dte,
+          spreadPct: setupAwareScore.details.spreadPct
         };
       })
       .filter((c) => c.dte != null && c.dte >= window.minDte && c.dte <= window.maxDte)
       .sort((a, b) => b.score - a.score);
 
-    picked[window.key] = ranked[0] ? { ...ranked[0], score: ranked[0].score.toFixed(1) } : null;
+    picked[window.key] = ranked[0] ?? null;
   }
 
+  picked.bestOneMonth = picked.best1MonthCall;
+  picked.bestTwoMonth = picked.best2MonthCall;
   return picked;
 }
 
@@ -576,13 +663,16 @@ function RecommendationCard({ title, contract }) {
             Bid/Ask {formatCurrency(contract.bid)} / {formatCurrency(contract.ask)} · IV {contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(2) : 'N/A'}
           </p>
           <p style={{ margin: '0 0 8px 0', color: '#111827', fontWeight: 600 }}>Estimated setup probability: {contract.estimatedSetupProbability}</p>
+          <p style={{ margin: '0 0 8px 0', color: '#111827', fontWeight: 600 }}>
+            Contract Score {contract.contractScore ?? 'N/A'} · Confidence {contract.confidenceLabel ?? 'N/A'}
+          </p>
           <p style={{ margin: '0 0 6px 0', color: '#374151' }}>
             Setup {contract.chartSetupType} · Buy Zone {contract.buyZone}
           </p>
           <p style={{ margin: '0 0 6px 0', color: '#374151' }}>
             Invalidation {contract.invalidation} · Target {contract.target}
           </p>
-          <p style={{ margin: 0, color: '#4b5563' }}>{contract.reasoning}</p>
+          <p style={{ margin: 0, color: '#4b5563', lineHeight: 1.45 }}>{contract.contractReasoning}</p>
         </>
       ) : (
         <p style={{ margin: 0, color: '#6b7280' }}>No contract met this expiration window with current filters/liquidity.</p>
@@ -749,8 +839,8 @@ export default async function HomePage({ searchParams }) {
       <SignalSummaryPanel signals={analysis.intradaySignals} />
 
       <section style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
-        <RecommendationCard title="Best 1-Month Call" contract={recommendations.bestOneMonth} />
-        <RecommendationCard title="Best 2-Month Call" contract={recommendations.bestTwoMonth} />
+        <RecommendationCard title="Best 1-Month Call" contract={recommendations.best1MonthCall} />
+        <RecommendationCard title="Best 2-Month Call" contract={recommendations.best2MonthCall} />
       </section>
 
       <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, overflowX: 'auto' }}>
