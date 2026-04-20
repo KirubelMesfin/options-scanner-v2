@@ -29,6 +29,25 @@ function formatPercent(value) {
   return value == null ? 'N/A' : `${value.toFixed(2)}%`;
 }
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function average(values) {
+  if (!values.length) return null;
+  return values.reduce((acc, v) => acc + v, 0) / values.length;
+}
+
+function highest(values) {
+  if (!values.length) return null;
+  return Math.max(...values);
+}
+
+function lowest(values) {
+  if (!values.length) return null;
+  return Math.min(...values);
+}
+
 function getDaysToExpiration(expirationDate) {
   if (!expirationDate) return null;
   const now = new Date();
@@ -36,58 +55,108 @@ function getDaysToExpiration(expirationDate) {
   return Math.ceil((exp - now) / (1000 * 60 * 60 * 24));
 }
 
-function buildReasoning(contract, stockPrice) {
-  const reasons = [];
-  const spread = contract.ask != null && contract.bid != null ? contract.ask - contract.bid : null;
-  const spreadPct = spread != null && contract.midpoint > 0 ? spread / contract.midpoint : null;
-
-  if ((contract.volume ?? 0) >= 500) reasons.push('strong trading volume');
-  else if ((contract.volume ?? 0) >= 100) reasons.push('healthy volume');
-
-  if ((contract.openInterest ?? 0) >= 1000) reasons.push('deep open interest');
-  else if ((contract.openInterest ?? 0) >= 200) reasons.push('solid open interest');
-
-  if (spreadPct != null && spreadPct <= 0.1) reasons.push('tight bid-ask spread');
-
-  if (contract.impliedVolatility != null && contract.impliedVolatility >= 0.15 && contract.impliedVolatility <= 0.7) {
-    reasons.push('reasonable implied volatility');
-  }
-
-  if (stockPrice != null && contract.strike != null) {
-    const strikeDistancePct = Math.abs(contract.strike - stockPrice) / stockPrice;
-    if (strikeDistancePct <= 0.05) reasons.push('strike is close to spot price');
-  }
-
-  return reasons.length > 0
-    ? `Ranked highly due to ${reasons.slice(0, 3).join(', ')}.`
-    : 'Ranked on balanced liquidity, pricing, and strike placement.';
+function classifyTrend({ price, ma20, ma50, slope20 }) {
+  if (price == null || ma20 == null || ma50 == null || slope20 == null) return 'neutral';
+  if (price > ma20 && ma20 > ma50 && slope20 > 0) return 'bullish';
+  if (price < ma20 && ma20 < ma50 && slope20 < 0) return 'bearish';
+  return 'neutral';
 }
 
-function scoreContract(contract, stockPrice) {
-  const volume = contract.volume ?? 0;
-  const openInterest = contract.openInterest ?? 0;
-  const spread = contract.ask != null && contract.bid != null ? Math.max(contract.ask - contract.bid, 0) : null;
-  const mid = contract.midpoint;
-  const spreadPct = spread != null && mid > 0 ? spread / mid : null;
-  const iv = contract.impliedVolatility;
+function classifySetup({ trend, price, high5, high20, low20, ma20, ma50, atr }) {
+  if ([trend, price, high5, high20, low20, ma20, ma50, atr].some((v) => v == null)) return 'weak trend';
 
-  const volumeScore = Math.min(volume / 2000, 1) * 25;
-  const oiScore = Math.min(openInterest / 5000, 1) * 25;
-  const spreadScore = spreadPct == null ? 0 : Math.max(0, 1 - spreadPct / 0.4) * 20;
+  const breakoutThreshold = high20 - atr * 0.15;
+  const pullbackZoneLower = ma20 - atr * 0.6;
+  const pullbackZoneUpper = ma20 + atr * 0.3;
 
-  let ivScore = 0;
-  if (iv != null) {
-    const distanceFromIdeal = Math.abs(iv - 0.35);
-    ivScore = Math.max(0, 1 - distanceFromIdeal / 0.35) * 15;
+  if (trend === 'bullish' && price >= breakoutThreshold && price >= high5 - atr * 0.15) return 'breakout';
+  if (trend === 'bullish' && price >= pullbackZoneLower && price <= pullbackZoneUpper && price > ma50 && price > low20) return 'pullback';
+
+  const rangeHeight = high20 - low20;
+  if (rangeHeight > 0 && Math.abs(price - (high20 + low20) / 2) <= rangeHeight * 0.25) return 'range';
+
+  return 'weak trend';
+}
+
+function estimateEntryPlan({ price, setup, high20, low20, ma20, ma50, atr }) {
+  if (price == null || atr == null) {
+    return {
+      entryQuality: 'Low',
+      buyZone: 'N/A',
+      invalidation: 'N/A',
+      target: 'N/A'
+    };
   }
 
-  let strikeProximityScore = 0;
-  if (stockPrice != null && contract.strike != null) {
-    const strikeDistancePct = Math.abs(contract.strike - stockPrice) / stockPrice;
-    strikeProximityScore = Math.max(0, 1 - strikeDistancePct / 0.15) * 15;
+  if (setup === 'breakout') {
+    const buyLow = Math.max(price - atr * 0.3, 0);
+    const buyHigh = price + atr * 0.2;
+    const invalidation = ma20 ?? price - atr;
+    const target = high20 != null ? high20 + atr * 1.5 : price + atr * 2;
+    return {
+      entryQuality: 'High',
+      buyZone: `${formatCurrency(buyLow)} - ${formatCurrency(buyHigh)}`,
+      invalidation: formatCurrency(invalidation),
+      target: formatCurrency(target)
+    };
   }
 
-  return volumeScore + oiScore + spreadScore + ivScore + strikeProximityScore;
+  if (setup === 'pullback') {
+    const support = ma20 ?? ma50 ?? price;
+    const buyLow = Math.max(support - atr * 0.35, 0);
+    const buyHigh = support + atr * 0.25;
+    const invalidation = Math.min(low20 ?? support - atr, support - atr * 0.8);
+    const target = high20 != null ? high20 + atr * 0.8 : price + atr * 1.5;
+    return {
+      entryQuality: 'Good',
+      buyZone: `${formatCurrency(buyLow)} - ${formatCurrency(buyHigh)}`,
+      invalidation: formatCurrency(invalidation),
+      target: formatCurrency(target)
+    };
+  }
+
+  if (setup === 'range') {
+    const zone = `${formatCurrency(Math.max((low20 ?? price) + atr * 0.2, 0))} - ${formatCurrency((high20 ?? price) - atr * 0.2)}`;
+    return {
+      entryQuality: 'Mixed',
+      buyZone: zone,
+      invalidation: formatCurrency((low20 ?? price) - atr * 0.6),
+      target: formatCurrency(high20 ?? price + atr)
+    };
+  }
+
+  return {
+    entryQuality: 'Low',
+    buyZone: `${formatCurrency(price - atr * 0.2)} - ${formatCurrency(price + atr * 0.2)}`,
+    invalidation: formatCurrency((ma50 ?? low20 ?? price) - atr * 0.5),
+    target: formatCurrency(price + atr)
+  };
+}
+
+function probabilityBand(score) {
+  if (score >= 82) return '80-90%';
+  if (score >= 65) return '65-79%';
+  if (score >= 50) return '50-64%';
+  return 'Below 50%';
+}
+
+function scoreChartQuality(analysis) {
+  const { trend, setup, price, ma20, ma50, rsi, atr } = analysis;
+  if ([price, ma20, ma50, rsi, atr].some((v) => v == null)) return 35;
+
+  let score = 35;
+  if (trend === 'bullish') score += 20;
+  if (setup === 'breakout') score += 20;
+  else if (setup === 'pullback') score += 15;
+  else if (setup === 'range') score += 6;
+
+  if (price > ma20) score += 6;
+  if (price > ma50) score += 6;
+
+  if (rsi >= 48 && rsi <= 68) score += 8;
+  else if (rsi > 75) score -= 8;
+
+  return clamp(score, 5, 95);
 }
 
 function normalizeContract(raw) {
@@ -109,6 +178,59 @@ function normalizeContract(raw) {
     delta: toNumber(raw?.greeks?.delta),
     midpoint: bid != null && ask != null ? (bid + ask) / 2 : null
   };
+}
+
+function scoreContractQuality(contract, stockPrice, targetDte) {
+  const volume = contract.volume ?? 0;
+  const openInterest = contract.openInterest ?? 0;
+  const iv = contract.impliedVolatility;
+  const deltaAbs = contract.delta != null ? Math.abs(contract.delta) : null;
+  const spread = contract.ask != null && contract.bid != null ? Math.max(contract.ask - contract.bid, 0) : null;
+  const mid = contract.midpoint;
+  const spreadPct = spread != null && mid > 0 ? spread / mid : null;
+
+  const dte = getDaysToExpiration(contract.expiration);
+  const strikeDistancePct = stockPrice != null && contract.strike != null ? Math.abs(contract.strike - stockPrice) / stockPrice : 1;
+
+  const strikeScore = Math.max(0, 1 - strikeDistancePct / 0.18) * 24;
+  const dteScore = dte == null ? 0 : Math.max(0, 1 - Math.abs(dte - targetDte) / 35) * 16;
+
+  let deltaScore = 0;
+  if (deltaAbs != null) {
+    const distance = Math.abs(deltaAbs - 0.45);
+    deltaScore = Math.max(0, 1 - distance / 0.35) * 16;
+  }
+
+  const volumeScore = Math.min(volume / 2000, 1) * 14;
+  const oiScore = Math.min(openInterest / 5000, 1) * 12;
+  const spreadScore = spreadPct == null ? 0 : Math.max(0, 1 - spreadPct / 0.35) * 10;
+
+  let ivScore = 0;
+  if (iv != null) {
+    const distanceFromIdeal = Math.abs(iv - 0.35);
+    ivScore = Math.max(0, 1 - distanceFromIdeal / 0.45) * 8;
+  }
+
+  return {
+    score: strikeScore + dteScore + deltaScore + volumeScore + oiScore + spreadScore + ivScore,
+    details: {
+      strikeDistancePct,
+      dte,
+      spreadPct
+    }
+  };
+}
+
+function buildContractExplanation(contract, analysis, finalScore, band) {
+  const pieces = [];
+  if (analysis.trend === 'bullish') pieces.push('price trend is bullish above key moving averages');
+  if (analysis.setup === 'breakout') pieces.push('chart is pressing recent highs in a breakout structure');
+  if (analysis.setup === 'pullback') pieces.push('chart is pulling back into support within an uptrend');
+  if ((contract.volume ?? 0) >= 200) pieces.push('contract has usable volume');
+  if ((contract.openInterest ?? 0) >= 500) pieces.push('open interest is supportive');
+  if (contract.delta != null) pieces.push(`delta is ${contract.delta.toFixed(2)} for directional exposure`);
+
+  return `Estimated setup probability: ${band} (score ${finalScore.toFixed(1)}/100). ${pieces.slice(0, 4).join(', ')}.`;
 }
 
 async function fetchJson(url) {
@@ -143,17 +265,141 @@ async function getStockContext(ticker, apiKey) {
   };
 }
 
+async function getDailyBars(ticker, apiKey) {
+  const now = new Date();
+  const from = new Date(now.getTime() - 180 * 24 * 60 * 60 * 1000);
+  const fromDate = from.toISOString().slice(0, 10);
+  const toDate = now.toISOString().slice(0, 10);
+  const url = `${API_BASE}/v2/aggs/ticker/${ticker}/range/1/day/${fromDate}/${toDate}?adjusted=true&sort=asc&limit=500&apiKey=${apiKey}`;
+  const data = await fetchJson(url);
+
+  return (data?.results ?? []).map((bar) => ({
+    t: bar.t,
+    o: toNumber(bar.o),
+    h: toNumber(bar.h),
+    l: toNumber(bar.l),
+    c: toNumber(bar.c),
+    v: toNumber(bar.v)
+  }));
+}
+
+function calculateRsi(closes, period = 14) {
+  if (closes.length <= period) return null;
+
+  let gain = 0;
+  let loss = 0;
+  for (let i = 1; i <= period; i += 1) {
+    const change = closes[i] - closes[i - 1];
+    if (change >= 0) gain += change;
+    else loss -= change;
+  }
+
+  let avgGain = gain / period;
+  let avgLoss = loss / period;
+
+  for (let i = period + 1; i < closes.length; i += 1) {
+    const change = closes[i] - closes[i - 1];
+    const currentGain = Math.max(change, 0);
+    const currentLoss = Math.max(-change, 0);
+    avgGain = (avgGain * (period - 1) + currentGain) / period;
+    avgLoss = (avgLoss * (period - 1) + currentLoss) / period;
+  }
+
+  if (avgLoss === 0) return 100;
+  const rs = avgGain / avgLoss;
+  return 100 - 100 / (1 + rs);
+}
+
+function calculateAtr(bars, period = 14) {
+  if (bars.length <= period) return null;
+  const trueRanges = [];
+
+  for (let i = 1; i < bars.length; i += 1) {
+    const high = bars[i].h;
+    const low = bars[i].l;
+    const prevClose = bars[i - 1].c;
+    const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+    trueRanges.push(tr);
+  }
+
+  return average(trueRanges.slice(-period));
+}
+
+function analyzeChart(bars) {
+  if (!bars.length) {
+    return {
+      hasData: false,
+      price: null,
+      high5: null,
+      low5: null,
+      high20: null,
+      low20: null,
+      high50: null,
+      low50: null,
+      ma20: null,
+      ma50: null,
+      rsi: null,
+      atr: null,
+      trend: 'neutral',
+      setup: 'weak trend',
+      entryQuality: 'Low',
+      buyZone: 'N/A',
+      invalidation: 'N/A',
+      target: 'N/A'
+    };
+  }
+
+  const closes = bars.map((b) => b.c).filter((v) => v != null);
+  const highs = bars.map((b) => b.h).filter((v) => v != null);
+  const lows = bars.map((b) => b.l).filter((v) => v != null);
+
+  const lastClose = closes.at(-1) ?? null;
+  const ma20 = average(closes.slice(-20));
+  const ma50 = average(closes.slice(-50));
+  const prevMa20 = average(closes.slice(-21, -1));
+  const slope20 = ma20 != null && prevMa20 != null ? ma20 - prevMa20 : null;
+
+  const analysis = {
+    hasData: true,
+    price: lastClose,
+    high5: highest(highs.slice(-5)),
+    low5: lowest(lows.slice(-5)),
+    high20: highest(highs.slice(-20)),
+    low20: lowest(lows.slice(-20)),
+    high50: highest(highs.slice(-50)),
+    low50: lowest(lows.slice(-50)),
+    ma20,
+    ma50,
+    rsi: calculateRsi(closes, 14),
+    atr: calculateAtr(bars, 14),
+    trend: 'neutral',
+    setup: 'weak trend',
+    entryQuality: 'Low',
+    buyZone: 'N/A',
+    invalidation: 'N/A',
+    target: 'N/A'
+  };
+
+  analysis.trend = classifyTrend({ price: analysis.price, ma20: analysis.ma20, ma50: analysis.ma50, slope20 });
+  analysis.setup = classifySetup(analysis);
+
+  const plan = estimateEntryPlan(analysis);
+  analysis.entryQuality = plan.entryQuality;
+  analysis.buyZone = plan.buyZone;
+  analysis.invalidation = plan.invalidation;
+  analysis.target = plan.target;
+
+  return analysis;
+}
+
 async function getOptionsChain(ticker, apiKey) {
   let nextUrl = `${API_BASE}/v3/snapshot/options/${ticker}?limit=250&apiKey=${apiKey}`;
   const results = [];
   let safetyCounter = 0;
 
   while (nextUrl && safetyCounter < 4) {
-    // limit pagination to keep server response time reasonable
     const data = await fetchJson(nextUrl);
-    if (Array.isArray(data?.results)) {
-      results.push(...data.results);
-    }
+    if (Array.isArray(data?.results)) results.push(...data.results);
     nextUrl = data?.next_url ? `${data.next_url}&apiKey=${apiKey}` : null;
     safetyCounter += 1;
   }
@@ -166,8 +412,8 @@ function formatFutureDate(daysAhead) {
   return target.toISOString().slice(0, 10);
 }
 
-function createMockContract({ ticker, contractType, expiration, strike, stockPrice, priceFactor }) {
-  const intrinsic = contractType === 'call' ? Math.max(stockPrice - strike, 0) : Math.max(strike - stockPrice, 0);
+function createMockContract({ ticker, expiration, strike, stockPrice, priceFactor }) {
+  const intrinsic = Math.max(stockPrice - strike, 0);
   const timeValue = Math.max(stockPrice * priceFactor, 0.15);
   const midpoint = Number((intrinsic * 0.18 + timeValue).toFixed(2));
   const bid = Number(Math.max(midpoint - 0.08, 0.01).toFixed(2));
@@ -175,8 +421,8 @@ function createMockContract({ ticker, contractType, expiration, strike, stockPri
   const iv = Number((0.22 + Math.abs(strike - stockPrice) / stockPrice).toFixed(3));
 
   return {
-    ticker: `MOCK-${ticker}-${expiration.replaceAll('-', '')}-${contractType[0].toUpperCase()}${Math.round(strike)}`,
-    contractType,
+    ticker: `MOCK-${ticker}-${expiration.replaceAll('-', '')}-C${Math.round(strike)}`,
+    contractType: 'call',
     strike: Number(strike.toFixed(2)),
     expiration,
     bid,
@@ -185,7 +431,7 @@ function createMockContract({ ticker, contractType, expiration, strike, stockPri
     volume: Math.round(80 + (stockPrice / strike) * 120),
     openInterest: Math.round(180 + (stockPrice / strike) * 260),
     impliedVolatility: iv,
-    delta: contractType === 'call' ? Number((0.35 + (stockPrice - strike) / stockPrice).toFixed(3)) : Number((-0.35 + (strike - stockPrice) / stockPrice).toFixed(3)),
+    delta: Number((0.35 + (stockPrice - strike) / stockPrice).toFixed(3)),
     midpoint,
     dataSource: 'mock'
   };
@@ -200,8 +446,7 @@ function buildMockContracts(ticker, stockPrice) {
   for (const expiration of expirations) {
     for (const step of strikeSteps) {
       const strike = basePrice * step;
-      contracts.push(createMockContract({ ticker, contractType: 'call', expiration, strike, stockPrice: basePrice, priceFactor: 0.012 }));
-      contracts.push(createMockContract({ ticker, contractType: 'put', expiration, strike, stockPrice: basePrice, priceFactor: 0.01 }));
+      contracts.push(createMockContract({ ticker, expiration, strike, stockPrice: basePrice, priceFactor: 0.012 }));
     }
   }
 
@@ -211,13 +456,16 @@ function buildMockContracts(ticker, stockPrice) {
 async function getOptionsData(ticker, apiKey, stockPrice) {
   try {
     const contracts = await getOptionsChain(ticker, apiKey);
-    return { contracts: contracts.map((c) => ({ ...c, dataSource: 'polygon' })), restrictionMessage: '' };
+    return {
+      contracts: contracts.filter((c) => c.contractType === 'call').map((c) => ({ ...c, dataSource: 'polygon' })),
+      restrictionMessage: ''
+    };
   } catch (error) {
     if (error instanceof PolygonAccessError && error.status === 403) {
       return {
         contracts: buildMockContracts(ticker, stockPrice),
         restrictionMessage:
-          'Live options chain data is restricted on your Polygon plan (HTTP 403). Showing a simplified mock scanner built from free-tier stock data.'
+          'Live options chain data is restricted on your Polygon plan (HTTP 403). Showing chart analysis + fallback simulated call contracts.'
       };
     }
 
@@ -225,77 +473,50 @@ async function getOptionsData(ticker, apiKey, stockPrice) {
   }
 }
 
-function parseFilters(searchParams, stockPrice) {
-  const optionType = searchParams?.optionType ?? 'all';
-  const expirationFrom = searchParams?.expirationFrom || '';
-  const expirationTo = searchParams?.expirationTo || '';
-  const minVolume = Math.max(0, Number(searchParams?.minVolume ?? 0) || 0);
-  const minOpenInterest = Math.max(0, Number(searchParams?.minOpenInterest ?? 0) || 0);
-  const maxSpread = Math.max(0, Number(searchParams?.maxSpread ?? 10) || 10);
-  const nearMoneyOnly = searchParams?.nearMoneyOnly === 'on';
-  const nearMoneyThresholdPct = 0.05;
+function buildRecommendations(contracts, stockPrice, analysis) {
+  const windows = [
+    { key: 'bestOneMonth', label: 'Best 1-Month Call', minDte: 20, maxDte: 45, targetDte: 32 },
+    { key: 'bestTwoMonth', label: 'Best 2-Month Call', minDte: 46, maxDte: 80, targetDte: 62 }
+  ];
 
-  return {
-    optionType,
-    expirationFrom,
-    expirationTo,
-    minVolume,
-    minOpenInterest,
-    maxSpread,
-    nearMoneyOnly,
-    nearMoneyThresholdPct,
-    stockPrice
-  };
-}
+  const chartScore = scoreChartQuality(analysis);
 
-function applyFilters(contracts, filters) {
-  return contracts.filter((contract) => {
-    if (filters.optionType !== 'all' && contract.contractType !== filters.optionType) return false;
+  const picked = {};
 
-    if (filters.expirationFrom && contract.expiration && contract.expiration < filters.expirationFrom) return false;
-    if (filters.expirationTo && contract.expiration && contract.expiration > filters.expirationTo) return false;
-
-    if ((contract.volume ?? 0) < filters.minVolume) return false;
-    if ((contract.openInterest ?? 0) < filters.minOpenInterest) return false;
-
-    const spread = contract.ask != null && contract.bid != null ? contract.ask - contract.bid : null;
-    if (spread != null && spread > filters.maxSpread) return false;
-
-    if (filters.nearMoneyOnly && filters.stockPrice != null && contract.strike != null) {
-      const strikeDistancePct = Math.abs(contract.strike - filters.stockPrice) / filters.stockPrice;
-      if (strikeDistancePct > filters.nearMoneyThresholdPct) return false;
-    }
-
-    return true;
-  });
-}
-
-function findBestCalls(contracts, stockPrice) {
-  const calls = contracts.filter((c) => c.contractType === 'call');
-  const scored = calls.map((contract) => ({ ...contract, score: scoreContract(contract, stockPrice) }));
-
-  const inRangeBest = (minDays, maxDays) =>
-    scored
-      .filter((c) => {
-        const dte = getDaysToExpiration(c.expiration);
-        return dte != null && dte >= minDays && dte <= maxDays;
+  for (const window of windows) {
+    const ranked = contracts
+      .map((contract) => {
+        const { score: contractScore, details } = scoreContractQuality(contract, stockPrice, window.targetDte);
+        const finalScore = chartScore * 0.58 + contractScore * 0.42;
+        const band = probabilityBand(finalScore);
+        return {
+          ...contract,
+          score: finalScore,
+          contractQualityScore: contractScore,
+          chartQualityScore: chartScore,
+          estimatedSetupProbability: band,
+          chartSetupType: analysis.setup,
+          trend: analysis.trend,
+          buyZone: analysis.buyZone,
+          invalidation: analysis.invalidation,
+          target: analysis.target,
+          entryQuality: analysis.entryQuality,
+          reasoning: buildContractExplanation(contract, analysis, finalScore, band),
+          strikeDistancePct: details.strikeDistancePct,
+          dte: details.dte,
+          spreadPct: details.spreadPct
+        };
       })
-      .sort((a, b) => b.score - a.score)[0] ?? null;
+      .filter((c) => c.dte != null && c.dte >= window.minDte && c.dte <= window.maxDte)
+      .sort((a, b) => b.score - a.score);
 
-  const bestOneMonth = inRangeBest(20, 45);
-  const bestTwoMonth = inRangeBest(46, 75);
+    picked[window.key] = ranked[0] ? { ...ranked[0], score: ranked[0].score.toFixed(1) } : null;
+  }
 
-  return {
-    bestOneMonth: bestOneMonth
-      ? { ...bestOneMonth, reasoning: buildReasoning(bestOneMonth, stockPrice), score: bestOneMonth.score.toFixed(1) }
-      : null,
-    bestTwoMonth: bestTwoMonth
-      ? { ...bestTwoMonth, reasoning: buildReasoning(bestTwoMonth, stockPrice), score: bestTwoMonth.score.toFixed(1) }
-      : null
-  };
+  return picked;
 }
 
-function SuggestionCard({ title, contract }) {
+function RecommendationCard({ title, contract }) {
   return (
     <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, flex: 1, minWidth: 260 }}>
       <h3 style={{ marginTop: 0, marginBottom: 10 }}>{title}</h3>
@@ -303,17 +524,54 @@ function SuggestionCard({ title, contract }) {
         <>
           <p style={{ margin: '0 0 8px 0', fontWeight: 700 }}>{contract.ticker}</p>
           <p style={{ margin: '0 0 8px 0', color: '#374151' }}>
-            Strike {formatCurrency(contract.strike)} · Exp {contract.expiration} · Score {contract.score}
+            Strike {formatCurrency(contract.strike)} · Exp {contract.expiration} · Delta {contract.delta != null ? contract.delta.toFixed(2) : 'N/A'}
           </p>
           <p style={{ margin: '0 0 8px 0', color: '#374151' }}>
-            Bid/Ask {formatCurrency(contract.bid)} / {formatCurrency(contract.ask)} · IV{' '}
-            {contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(2) : 'N/A'}
+            Bid/Ask {formatCurrency(contract.bid)} / {formatCurrency(contract.ask)} · IV {contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(2) : 'N/A'}
+          </p>
+          <p style={{ margin: '0 0 8px 0', color: '#111827', fontWeight: 600 }}>Estimated setup probability: {contract.estimatedSetupProbability}</p>
+          <p style={{ margin: '0 0 6px 0', color: '#374151' }}>
+            Setup {contract.chartSetupType} · Buy Zone {contract.buyZone}
+          </p>
+          <p style={{ margin: '0 0 6px 0', color: '#374151' }}>
+            Invalidation {contract.invalidation} · Target {contract.target}
           </p>
           <p style={{ margin: 0, color: '#4b5563' }}>{contract.reasoning}</p>
         </>
       ) : (
-        <p style={{ margin: 0, color: '#6b7280' }}>No contract met the scoring criteria for this expiration window.</p>
+        <p style={{ margin: 0, color: '#6b7280' }}>No contract met this expiration window with current filters/liquidity.</p>
       )}
+    </div>
+  );
+}
+
+function ChartSummaryPanel({ stock, analysis, barsCount }) {
+  return (
+    <section style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, marginBottom: 16 }}>
+      <h2 style={{ marginTop: 0, marginBottom: 10 }}>Chart Summary ({barsCount} daily bars)</h2>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 10 }}>
+        <Stat label="Current Price" value={formatCurrency(stock.price ?? analysis.price)} />
+        <Stat label="Trend" value={analysis.trend} />
+        <Stat label="Setup" value={analysis.setup} />
+        <Stat label="Entry Quality" value={analysis.entryQuality} />
+        <Stat label="5D High / Low" value={`${formatCurrency(analysis.high5)} / ${formatCurrency(analysis.low5)}`} />
+        <Stat label="20D High / Low" value={`${formatCurrency(analysis.high20)} / ${formatCurrency(analysis.low20)}`} />
+        <Stat label="50D High / Low" value={`${formatCurrency(analysis.high50)} / ${formatCurrency(analysis.low50)}`} />
+        <Stat label="MA20 / MA50" value={`${formatCurrency(analysis.ma20)} / ${formatCurrency(analysis.ma50)}`} />
+        <Stat label="RSI" value={analysis.rsi != null ? analysis.rsi.toFixed(1) : 'N/A'} />
+        <Stat label="ATR" value={formatCurrency(analysis.atr)} />
+        <Stat label="Buy Zone" value={analysis.buyZone} />
+        <Stat label="Invalidation / Target" value={`${analysis.invalidation} / ${analysis.target}`} />
+      </div>
+    </section>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div style={{ border: '1px solid #f3f4f6', borderRadius: 10, padding: 10 }}>
+      <div style={{ color: '#6b7280', fontSize: 12, marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 14, fontWeight: 600 }}>{value}</div>
     </div>
   );
 }
@@ -325,116 +583,70 @@ export default async function HomePage({ searchParams }) {
   if (!apiKey) {
     return (
       <main style={{ maxWidth: 1200, margin: '0 auto', padding: 24 }}>
-        <h1>Options Scanner</h1>
-        <p style={{ color: '#b91c1c' }}>
-          POLYGON_API_KEY is not set. Add it to your environment variables before using the scanner.
-        </p>
+        <h1>Options Recommendation Engine</h1>
+        <p style={{ color: '#b91c1c' }}>POLYGON_API_KEY is not set. Add it to your environment variables before using the scanner.</p>
       </main>
     );
   }
 
-  let contracts = [];
   let stock = { price: null, dailyChangePercent: null, marketCap: null, companyName: ticker };
-  let errorMessage = '';
+  let bars = [];
+  let contracts = [];
   let restrictionMessage = '';
+  let errorMessage = '';
 
   try {
     stock = await getStockContext(ticker, apiKey);
+    bars = await getDailyBars(ticker, apiKey);
     const optionsData = await getOptionsData(ticker, apiKey, stock.price);
     contracts = optionsData.contracts;
     restrictionMessage = optionsData.restrictionMessage;
   } catch (error) {
-    errorMessage = error.message || 'Failed to load scanner data.';
+    errorMessage = error.message || 'Failed to load recommendation engine data.';
   }
 
-  const filters = parseFilters(searchParams, stock.price);
-  const filteredContracts = applyFilters(contracts, filters);
-  const suggestions = findBestCalls(filteredContracts, stock.price);
+  const analysis = analyzeChart(bars);
+  const recommendations = buildRecommendations(contracts, stock.price ?? analysis.price, analysis);
 
   return (
     <main style={{ maxWidth: 1200, margin: '0 auto', padding: 24 }}>
-      <h1 style={{ marginBottom: 6 }}>Options Scanner</h1>
-      <p style={{ marginTop: 0, color: '#4b5563' }}>Search ticker symbols and scan options by liquidity, pricing, and proximity.</p>
+      <h1 style={{ marginBottom: 6 }}>Chart-Aware Options Recommendation Engine</h1>
+      <p style={{ marginTop: 0, color: '#4b5563' }}>
+        Uses Polygon daily chart + options chain data to estimate setup quality for call contracts. “Estimated setup probability” is a scoring band, not a calibrated statistical probability.
+      </p>
 
-      <form method="GET" style={{ display: 'grid', gap: 12, gridTemplateColumns: 'repeat(12, minmax(0, 1fr))', marginBottom: 16 }}>
-        <div style={{ gridColumn: 'span 3' }}>
-          <label htmlFor="ticker" style={{ display: 'block', fontWeight: 600, marginBottom: 6 }}>
-            Ticker
-          </label>
-          <input id="ticker" name="ticker" defaultValue={ticker} placeholder="AAPL" style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }} />
-        </div>
-        <div style={{ gridColumn: 'span 2' }}>
-          <label htmlFor="optionType" style={{ display: 'block', fontWeight: 600, marginBottom: 6 }}>
-            Type
-          </label>
-          <select id="optionType" name="optionType" defaultValue={filters.optionType} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }}>
-            <option value="all">Calls + Puts</option>
-            <option value="call">Calls only</option>
-            <option value="put">Puts only</option>
-          </select>
-        </div>
-        <div style={{ gridColumn: 'span 2' }}>
-          <label htmlFor="expirationFrom" style={{ display: 'block', fontWeight: 600, marginBottom: 6 }}>
-            Expiration from
-          </label>
-          <input type="date" id="expirationFrom" name="expirationFrom" defaultValue={filters.expirationFrom} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }} />
-        </div>
-        <div style={{ gridColumn: 'span 2' }}>
-          <label htmlFor="expirationTo" style={{ display: 'block', fontWeight: 600, marginBottom: 6 }}>
-            Expiration to
-          </label>
-          <input type="date" id="expirationTo" name="expirationTo" defaultValue={filters.expirationTo} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }} />
-        </div>
-        <div style={{ gridColumn: 'span 1' }}>
-          <label htmlFor="minVolume" style={{ display: 'block', fontWeight: 600, marginBottom: 6 }}>
-            Min vol
-          </label>
-          <input type="number" id="minVolume" name="minVolume" min="0" defaultValue={filters.minVolume} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }} />
-        </div>
-        <div style={{ gridColumn: 'span 1' }}>
-          <label htmlFor="minOpenInterest" style={{ display: 'block', fontWeight: 600, marginBottom: 6 }}>
-            Min OI
-          </label>
-          <input type="number" id="minOpenInterest" name="minOpenInterest" min="0" defaultValue={filters.minOpenInterest} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }} />
-        </div>
-        <div style={{ gridColumn: 'span 1' }}>
-          <label htmlFor="maxSpread" style={{ display: 'block', fontWeight: 600, marginBottom: 6 }}>
-            Max spread
-          </label>
-          <input type="number" id="maxSpread" name="maxSpread" min="0" step="0.01" defaultValue={filters.maxSpread} style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }} />
-        </div>
-        <div style={{ gridColumn: 'span 2', display: 'flex', alignItems: 'end', gap: 12 }}>
-          <label htmlFor="nearMoneyOnly" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <input type="checkbox" id="nearMoneyOnly" name="nearMoneyOnly" defaultChecked={filters.nearMoneyOnly} />
-            Near-the-money only
-          </label>
-          <button type="submit" style={{ padding: '10px 16px', borderRadius: 8, border: 'none', background: '#111827', color: '#fff', cursor: 'pointer' }}>
-            Scan
-          </button>
-        </div>
+      <form method="GET" style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 16 }}>
+        <input
+          id="ticker"
+          name="ticker"
+          defaultValue={ticker}
+          placeholder="Search ticker (AAPL)"
+          style={{ width: 240, padding: 10, borderRadius: 8, border: '1px solid #d1d5db' }}
+        />
+        <button type="submit" style={{ padding: '10px 16px', borderRadius: 8, border: 'none', background: '#111827', color: '#fff', cursor: 'pointer' }}>
+          Analyze
+        </button>
       </form>
 
       {errorMessage ? (
-        <div style={{ background: '#fef2f2', color: '#991b1b', border: '1px solid #fecaca', borderRadius: 10, padding: 12, marginBottom: 16 }}>
-          {errorMessage}
-        </div>
+        <div style={{ background: '#fef2f2', color: '#991b1b', border: '1px solid #fecaca', borderRadius: 10, padding: 12, marginBottom: 16 }}>{errorMessage}</div>
       ) : null}
       {restrictionMessage ? (
-        <div style={{ background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: 10, padding: 12, marginBottom: 16 }}>
-          {restrictionMessage}
-        </div>
+        <div style={{ background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: 10, padding: 12, marginBottom: 16 }}>{restrictionMessage}</div>
       ) : null}
 
       <section style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
+          <div style={{ color: '#6b7280', marginBottom: 8 }}>Ticker</div>
+          <div style={{ fontSize: 24, fontWeight: 700 }}>{stock.companyName}</div>
+        </div>
+        <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
           <div style={{ color: '#6b7280', marginBottom: 8 }}>Current Price</div>
-          <div style={{ fontSize: 24, fontWeight: 700 }}>{formatCurrency(stock.price)}</div>
+          <div style={{ fontSize: 24, fontWeight: 700 }}>{formatCurrency(stock.price ?? analysis.price)}</div>
         </div>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
           <div style={{ color: '#6b7280', marginBottom: 8 }}>Daily Change</div>
-          <div style={{ fontSize: 24, fontWeight: 700, color: (stock.dailyChangePercent ?? 0) >= 0 ? '#047857' : '#b91c1c' }}>
-            {formatPercent(stock.dailyChangePercent)}
-          </div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: (stock.dailyChangePercent ?? 0) >= 0 ? '#047857' : '#b91c1c' }}>{formatPercent(stock.dailyChangePercent)}</div>
         </div>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
           <div style={{ color: '#6b7280', marginBottom: 8 }}>Market Cap</div>
@@ -442,9 +654,11 @@ export default async function HomePage({ searchParams }) {
         </div>
       </section>
 
+      <ChartSummaryPanel stock={stock} analysis={analysis} barsCount={bars.length} />
+
       <section style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
-        <SuggestionCard title="Best 1-Month Call" contract={suggestions.bestOneMonth} />
-        <SuggestionCard title="Best 2-Month Call" contract={suggestions.bestTwoMonth} />
+        <RecommendationCard title="Best 1-Month Call" contract={recommendations.bestOneMonth} />
+        <RecommendationCard title="Best 2-Month Call" contract={recommendations.bestTwoMonth} />
       </section>
 
       <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, overflowX: 'auto' }}>
@@ -452,7 +666,6 @@ export default async function HomePage({ searchParams }) {
           <thead>
             <tr style={{ textAlign: 'left', background: '#f9fafb' }}>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Contract</th>
-              <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Type</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Strike</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Expiration</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Bid</th>
@@ -462,15 +675,15 @@ export default async function HomePage({ searchParams }) {
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Open Interest</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>IV</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Delta</th>
+              <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>DTE</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Source</th>
             </tr>
           </thead>
           <tbody>
-            {filteredContracts.length > 0 ? (
-              filteredContracts.map((contract) => (
+            {contracts.length > 0 ? (
+              contracts.map((contract) => (
                 <tr key={contract.ticker}>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6', fontFamily: 'monospace', fontSize: 12 }}>{contract.ticker}</td>
-                  <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.contractType}</td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{formatCurrency(contract.strike)}</td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.expiration ?? 'N/A'}</td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{formatCurrency(contract.bid)}</td>
@@ -478,17 +691,16 @@ export default async function HomePage({ searchParams }) {
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{formatCurrency(contract.lastPrice)}</td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.volume ?? 'N/A'}</td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.openInterest ?? 'N/A'}</td>
-                  <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>
-                    {contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(3) : 'N/A'}
-                  </td>
+                  <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(3) : 'N/A'}</td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.delta != null ? contract.delta.toFixed(3) : 'N/A'}</td>
+                  <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{getDaysToExpiration(contract.expiration) ?? 'N/A'}</td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.dataSource ?? 'polygon'}</td>
                 </tr>
               ))
             ) : (
               <tr>
                 <td colSpan={12} style={{ padding: 14, color: '#6b7280' }}>
-                  No contracts matched the selected filters.
+                  No call contracts available. Chart analysis still shown above.
                 </td>
               </tr>
             )}
