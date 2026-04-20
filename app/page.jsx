@@ -2,6 +2,15 @@ const API_BASE = 'https://api.polygon.io';
 
 export const dynamic = 'force-dynamic';
 
+class PolygonAccessError extends Error {
+  constructor(message, status, details) {
+    super(message);
+    this.name = 'PolygonAccessError';
+    this.status = status;
+    this.details = details;
+  }
+}
+
 function toNumber(value) {
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
@@ -105,7 +114,8 @@ function normalizeContract(raw) {
 async function fetchJson(url) {
   const response = await fetch(url, { cache: 'no-store', headers: { Accept: 'application/json' } });
   if (!response.ok) {
-    throw new Error(`Polygon request failed (${response.status})`);
+    const details = await response.text().catch(() => '');
+    throw new PolygonAccessError(`Polygon request failed (${response.status})`, response.status, details);
   }
   return response.json();
 }
@@ -149,6 +159,70 @@ async function getOptionsChain(ticker, apiKey) {
   }
 
   return results.map(normalizeContract);
+}
+
+function formatFutureDate(daysAhead) {
+  const target = new Date(Date.now() + daysAhead * 24 * 60 * 60 * 1000);
+  return target.toISOString().slice(0, 10);
+}
+
+function createMockContract({ ticker, contractType, expiration, strike, stockPrice, priceFactor }) {
+  const intrinsic = contractType === 'call' ? Math.max(stockPrice - strike, 0) : Math.max(strike - stockPrice, 0);
+  const timeValue = Math.max(stockPrice * priceFactor, 0.15);
+  const midpoint = Number((intrinsic * 0.18 + timeValue).toFixed(2));
+  const bid = Number(Math.max(midpoint - 0.08, 0.01).toFixed(2));
+  const ask = Number((midpoint + 0.08).toFixed(2));
+  const iv = Number((0.22 + Math.abs(strike - stockPrice) / stockPrice).toFixed(3));
+
+  return {
+    ticker: `MOCK-${ticker}-${expiration.replaceAll('-', '')}-${contractType[0].toUpperCase()}${Math.round(strike)}`,
+    contractType,
+    strike: Number(strike.toFixed(2)),
+    expiration,
+    bid,
+    ask,
+    lastPrice: midpoint,
+    volume: Math.round(80 + (stockPrice / strike) * 120),
+    openInterest: Math.round(180 + (stockPrice / strike) * 260),
+    impliedVolatility: iv,
+    delta: contractType === 'call' ? Number((0.35 + (stockPrice - strike) / stockPrice).toFixed(3)) : Number((-0.35 + (strike - stockPrice) / stockPrice).toFixed(3)),
+    midpoint,
+    dataSource: 'mock'
+  };
+}
+
+function buildMockContracts(ticker, stockPrice) {
+  const basePrice = stockPrice && stockPrice > 0 ? stockPrice : 100;
+  const expirations = [formatFutureDate(30), formatFutureDate(60)];
+  const strikeSteps = [0.9, 0.95, 1, 1.05, 1.1];
+  const contracts = [];
+
+  for (const expiration of expirations) {
+    for (const step of strikeSteps) {
+      const strike = basePrice * step;
+      contracts.push(createMockContract({ ticker, contractType: 'call', expiration, strike, stockPrice: basePrice, priceFactor: 0.012 }));
+      contracts.push(createMockContract({ ticker, contractType: 'put', expiration, strike, stockPrice: basePrice, priceFactor: 0.01 }));
+    }
+  }
+
+  return contracts;
+}
+
+async function getOptionsData(ticker, apiKey, stockPrice) {
+  try {
+    const contracts = await getOptionsChain(ticker, apiKey);
+    return { contracts: contracts.map((c) => ({ ...c, dataSource: 'polygon' })), restrictionMessage: '' };
+  } catch (error) {
+    if (error instanceof PolygonAccessError && error.status === 403) {
+      return {
+        contracts: buildMockContracts(ticker, stockPrice),
+        restrictionMessage:
+          'Live options chain data is restricted on your Polygon plan (HTTP 403). Showing a simplified mock scanner built from free-tier stock data.'
+      };
+    }
+
+    throw error;
+  }
 }
 
 function parseFilters(searchParams, stockPrice) {
@@ -262,9 +336,13 @@ export default async function HomePage({ searchParams }) {
   let contracts = [];
   let stock = { price: null, dailyChangePercent: null, marketCap: null, companyName: ticker };
   let errorMessage = '';
+  let restrictionMessage = '';
 
   try {
-    [contracts, stock] = await Promise.all([getOptionsChain(ticker, apiKey), getStockContext(ticker, apiKey)]);
+    stock = await getStockContext(ticker, apiKey);
+    const optionsData = await getOptionsData(ticker, apiKey, stock.price);
+    contracts = optionsData.contracts;
+    restrictionMessage = optionsData.restrictionMessage;
   } catch (error) {
     errorMessage = error.message || 'Failed to load scanner data.';
   }
@@ -341,6 +419,11 @@ export default async function HomePage({ searchParams }) {
           {errorMessage}
         </div>
       ) : null}
+      {restrictionMessage ? (
+        <div style={{ background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a', borderRadius: 10, padding: 12, marginBottom: 16 }}>
+          {restrictionMessage}
+        </div>
+      ) : null}
 
       <section style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
         <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, minWidth: 220 }}>
@@ -379,6 +462,7 @@ export default async function HomePage({ searchParams }) {
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Open Interest</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>IV</th>
               <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Delta</th>
+              <th style={{ padding: 10, borderBottom: '1px solid #e5e7eb' }}>Source</th>
             </tr>
           </thead>
           <tbody>
@@ -398,11 +482,12 @@ export default async function HomePage({ searchParams }) {
                     {contract.impliedVolatility != null ? contract.impliedVolatility.toFixed(3) : 'N/A'}
                   </td>
                   <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.delta != null ? contract.delta.toFixed(3) : 'N/A'}</td>
+                  <td style={{ padding: 10, borderBottom: '1px solid #f3f4f6' }}>{contract.dataSource ?? 'polygon'}</td>
                 </tr>
               ))
             ) : (
               <tr>
-                <td colSpan={11} style={{ padding: 14, color: '#6b7280' }}>
+                <td colSpan={12} style={{ padding: 14, color: '#6b7280' }}>
                   No contracts matched the selected filters.
                 </td>
               </tr>
