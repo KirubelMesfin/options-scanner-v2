@@ -46,6 +46,11 @@ function lowest(values) {
   return Math.min(...values);
 }
 
+function percentChange(fromValue, toValue) {
+  if (fromValue == null || toValue == null || fromValue === 0) return null;
+  return ((toValue - fromValue) / fromValue) * 100;
+}
+
 function getDaysToExpiration(expirationDate) {
   if (!expirationDate) return null;
   const now = new Date();
@@ -350,6 +355,55 @@ function calculateAtr(bars, period = 14) {
   return average(trueRanges.slice(-period));
 }
 
+function buildIntradaySignals({ bars, trend, ma20 }) {
+  if (bars.length < 21) {
+    return {
+      setupLabel: null,
+      momentumLabel: null,
+      recentHigh: null,
+      recentLow: null,
+      shortMovePercent: null,
+      supportReference: null,
+      insufficientData: true
+    };
+  }
+
+  const closes = bars.map((bar) => bar.c).filter((value) => value != null);
+  const highs = bars.map((bar) => bar.h).filter((value) => value != null);
+  const lows = bars.map((bar) => bar.l).filter((value) => value != null);
+
+  const latestClose = closes.at(-1) ?? null;
+  const prior20High = highest(highs.slice(-21, -1));
+  const recentHigh = highest(highs.slice(-20));
+  const recentLow = lowest(lows.slice(-20));
+  const shortMovePercent = percentChange(closes.at(-6), latestClose);
+  const supportReference = ma20 ?? recentLow;
+
+  const breakout = latestClose != null && prior20High != null ? latestClose > prior20High : false;
+  const pullback =
+    latestClose != null && supportReference != null && supportReference > 0
+      ? latestClose >= supportReference && latestClose <= supportReference * 1.015 && trend !== 'bearish'
+      : false;
+
+  let setupLabel = 'weak trend';
+  if (breakout) setupLabel = 'breakout';
+  else if (pullback) setupLabel = 'pullback';
+
+  let momentumLabel = 'weak';
+  if ((shortMovePercent ?? 0) >= 3) momentumLabel = 'strong';
+  else if ((shortMovePercent ?? 0) >= 1.5) momentumLabel = 'moderate';
+
+  return {
+    setupLabel,
+    momentumLabel,
+    recentHigh,
+    recentLow,
+    shortMovePercent,
+    supportReference,
+    insufficientData: false
+  };
+}
+
 function analyzeChart(bars) {
   if (!bars.length) {
     return {
@@ -370,7 +424,16 @@ function analyzeChart(bars) {
       entryQuality: 'Low',
       buyZone: 'N/A',
       invalidation: 'N/A',
-      target: 'N/A'
+      target: 'N/A',
+      intradaySignals: {
+        setupLabel: null,
+        momentumLabel: null,
+        recentHigh: null,
+        recentLow: null,
+        shortMovePercent: null,
+        supportReference: null,
+        insufficientData: true
+      }
     };
   }
 
@@ -413,6 +476,7 @@ function analyzeChart(bars) {
   analysis.buyZone = plan.buyZone;
   analysis.invalidation = plan.invalidation;
   analysis.target = plan.target;
+  analysis.intradaySignals = buildIntradaySignals({ bars, trend: analysis.trend, ma20: analysis.ma20 });
 
   return analysis;
 }
@@ -549,6 +613,27 @@ function ChartSummaryPanel({ stock, analysis, barsCount }) {
   );
 }
 
+function SignalSummaryPanel({ signals }) {
+  const notEnoughData = signals?.insufficientData || !signals?.setupLabel;
+  return (
+    <section style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 12, padding: 16, marginBottom: 16 }}>
+      <h2 style={{ marginTop: 0, marginBottom: 10 }}>Intraday Signal Snapshot (from delayed chart bars)</h2>
+      {notEnoughData ? (
+        <p style={{ margin: 0, color: '#6b7280' }}>Not enough data</p>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 10 }}>
+          <Stat label="Setup Label" value={signals.setupLabel} />
+          <Stat label="Momentum Label" value={signals.momentumLabel} />
+          <Stat label="Short Move (5 bars)" value={formatPercent(signals.shortMovePercent)} />
+          <Stat label="Recent High (20 bars)" value={formatCurrency(signals.recentHigh)} />
+          <Stat label="Recent Low (20 bars)" value={formatCurrency(signals.recentLow)} />
+          <Stat label="Support Reference" value={formatCurrency(signals.supportReference)} />
+        </div>
+      )}
+    </section>
+  );
+}
+
 function Stat({ label, value }) {
   return (
     <div style={{ border: '1px solid #f3f4f6', borderRadius: 10, padding: 10 }}>
@@ -661,6 +746,7 @@ export default async function HomePage({ searchParams }) {
       <LivePricePanel ticker={ticker} initialPrice={stock.price ?? analysis.price} initialDailyChangePercent={stock.dailyChangePercent} />
 
       <ChartSummaryPanel stock={stock} analysis={analysis} barsCount={bars.length} />
+      <SignalSummaryPanel signals={analysis.intradaySignals} />
 
       <section style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 16 }}>
         <RecommendationCard title="Best 1-Month Call" contract={recommendations.bestOneMonth} />
